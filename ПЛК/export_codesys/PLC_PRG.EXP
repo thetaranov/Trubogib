@@ -1,0 +1,174 @@
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+PROGRAM PLC_PRG
+VAR
+    (* Encoder / positioning parameters and state *)
+    COUNTS_PER_REV : INT := 360;
+    ANGLE_PER_COUNT : REAL := 1.0;
+    HYSTERESIS : REAL := 1.5;
+    MAX_MOVE_TIME : INT := 3000;
+
+    encoderCount : DINT := 0;
+    prevEncoderA : BOOL := FALSE;
+
+    gLocalTargetAngle : REAL := 0.0; (* local copy of target from Modbus *)
+
+    motorFwd : BOOL := FALSE;
+    motorRev : BOOL := FALSE;
+    isPositioned : BOOL := FALSE;
+    moveTimer : INT := 0;
+
+    (* Modbus / COM-service variables (library types) *)
+    Settings : COMSETTINGS_FALLBACK; (* fallback type when SysLibCom.lib types are not visible; replace with COMSETTINGS if library exports it *)
+    COM_SERVICE1 : COM_SERVICE; (* ComService.lib FB instance *)
+    getHold : MB_RD_HOLD_REGS; (* modbus.lib FB instance for Read Holding Registers *)
+
+    Buffer : ARRAY[0..255] OF BYTE;
+    cmpl : BOOL;
+    excep : BYTE;
+    DataSize : WORD;
+    TimeOut : TIME := T#50ms;
+    port_opened : BYTE := 0; (* 0=closed,2=opened *)
+    enabl : BOOL := TRUE; (* enable for modbus FBs *)
+
+    (* local temporaries used to unpack returned registers *)
+    tmp_dw : DWORD;
+    tmpFloat : REAL;
+    tmpHi : WORD;
+    tmpLo : WORD;
+    tmpDiff : REAL := 0.0; (* local diff variable declared here *)
+END_VAR
+
+(* @END_DECLARATION := '0' *)
+(* --- COM port initialization using COM_SERVICE FB --- *)
+IF port_opened = 0 THEN
+    (* configure COM port parameters using SysLibCom.COMSETTINGS structure fields *)
+    Settings.Port := COM1; (* use COM1 (PORTS enum from SysLibCom.lib) *)
+    Settings.dwBaudRate := 9600;
+    Settings.byParity := 0;
+    Settings.byStopBits := 0;
+    Settings.dwTimeout := 100;
+    Settings.dwBufferSize := 0;
+    Settings.dwScan := 0;
+
+    (* call COM_SERVICE to open the port; library defines required interface *)
+    COM_SERVICE1(Enable := (port_opened = 0), Settings := Settings, Task := 0);
+    IF COM_SERVICE1.ready THEN
+        port_opened := 2;
+    END_IF;
+END_IF;
+
+(* --- Modbus: read holding registers from ESP slave when port opened --- *)
+IF port_opened = 2 THEN
+    getHold(
+        Enable := enabl,
+        Mode := MB_RTU,
+        DevAddr := 1,
+        FirstAddr := 0,
+        Quantity := 11,
+        ComHandle := DWORD(Settings.Port), (* pass port as DWORD or replace with COM_SERVICE1.Handle if available *),
+        TimeOut := TimeOut,
+        Buffer := Buffer,
+        Complete => cmpl,
+        Exception => excep,
+        ByteCnt => DataSize
+    );
+
+    IF cmpl AND (excep = 0) THEN
+        (* unpack target angle (REAL) from registers 0..1 (hi/lo) - big-endian register order used in examples *)
+        tmpHi := Buffer[0];
+        tmpLo := Buffer[1];
+        tmp_dw := SHL(DWORD(tmpHi),16) OR DWORD(tmpLo);
+        tmpFloat := DWORD_TO_REAL(tmp_dw);
+        gLocalTargetAngle := tmpFloat;
+
+        (* unpack current angle registers 2..3 if needed *)
+        tmpHi := Buffer[2];
+        tmpLo := Buffer[3];
+        tmp_dw := SHL(DWORD(tmpHi),16) OR DWORD(tmpLo);
+        (* optional: set gCurrentAngle if you prefer to trust Modbus reading over encoder-derived value *)
+        (* gCurrentAngle := DWORD_TO_REAL(tmp_dw); *)
+    END_IF;
+END_IF;
+
+(* --- Encoder handling & position control --- *)
+IF gEncoderA AND NOT prevEncoderA THEN
+    IF gEncoderB THEN
+        encoderCount := encoderCount - 1;
+    ELSE
+        encoderCount := encoderCount + 1;
+    END_IF;
+END_IF;
+IF NOT gEncoderA AND prevEncoderA THEN
+    IF gEncoderB THEN
+        encoderCount := encoderCount + 1;
+    ELSE
+        encoderCount := encoderCount - 1;
+    END_IF;
+END_IF;
+prevEncoderA := gEncoderA;
+
+(* angle calculation: one pulse equals one degree as requested *)
+gEncoderCount := encoderCount; (* copy for external visibility / Modbus *)
+gCurrentAngle := DINT_TO_REAL((encoderCount MOD 360 + 360) MOD 360) * ANGLE_PER_COUNT;
+
+(* simple target normalization to 0..360 *)
+IF gLocalTargetAngle < 0.0 THEN
+    gLocalTargetAngle := gLocalTargetAngle + 360.0;
+END_IF;
+WHILE gLocalTargetAngle >= 360.0 DO
+    gLocalTargetAngle := gLocalTargetAngle - 360.0;
+END_WHILE;
+
+(* compute difference -180..180 *)
+tmpDiff := gLocalTargetAngle - gCurrentAngle;
+IF tmpDiff > 180.0 THEN
+    tmpDiff := tmpDiff - 360.0;
+ELSIF tmpDiff < -180.0 THEN
+    tmpDiff := tmpDiff + 360.0;
+END_IF;
+
+(* position control logic using tmpDiff and HYSTERESIS *)
+IF gDI_8 AND NOT gDI_9 AND (gCommand <> 2) THEN (* motorEnable and not alarm *)
+    IF ABS(tmpDiff) <= HYSTERESIS THEN
+        motorFwd := FALSE;
+        motorRev := FALSE;
+        isPositioned := TRUE;
+        moveTimer := 0;
+        gStatus := 2;
+        IF gErrorCode = 1 THEN
+            gErrorCode := 0;
+        END_IF;
+    ELSE
+        isPositioned := FALSE;
+        gStatus := 1;
+        IF tmpDiff > 0.0 THEN
+            motorFwd := TRUE; motorRev := FALSE;
+        ELSE
+            motorFwd := FALSE; motorRev := TRUE;
+        END_IF;
+        moveTimer := moveTimer + 1;
+        IF moveTimer > MAX_MOVE_TIME THEN
+            motorFwd := FALSE; motorRev := FALSE;
+            gErrorCode := 1; gStatus := 0;
+        END_IF;
+    END_IF;
+ELSE
+    motorFwd := FALSE; motorRev := FALSE;
+    IF NOT gDI_9 THEN gStatus := 0; END_IF;
+END_IF;
+
+(* command stop *)
+IF gCommand = 2 THEN motorFwd := FALSE; motorRev := FALSE; gStatus := 0; END_IF;
+
+(* test button: set all DOs when gDI_7 pressed *)
+IF gDI_7 THEN
+    gDO_1 := TRUE; gDO_2 := TRUE; gDO_3 := TRUE; gDO_4 := TRUE;
+    gDO_5 := TRUE; gDO_6 := TRUE; gDO_7 := TRUE; gDO_8 := TRUE;
+ELSE
+    gDO_1 := motorFwd; gDO_2 := motorRev; gDO_3 := isPositioned;
+END_IF;
+END_PROGRAM

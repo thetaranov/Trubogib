@@ -1,0 +1,820 @@
+
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+(* Local fallback: COMSETTINGS_FALLBACK - avoids collision with SysLibCom.lib when library types are not exposed to the IDE. Remove this TYPE when real `COMSETTINGS` is available. *)
+TYPE COMSETTINGS_FALLBACK : STRUCT
+    Port : INT;
+    dwBaudRate : DWORD;
+    byStopBits : BYTE;
+    byParity : BYTE;
+    dwTimeout : DWORD;
+    dwBufferSize : DWORD;
+    dwScan : DWORD;
+END_STRUCT
+END_TYPE
+PROGRAM PLC_PRG
+VAR
+    (* Encoder / positioning parameters and state *)
+    COUNTS_PER_REV : INT := 360;
+    ANGLE_PER_COUNT : REAL := 1.0;
+    HYSTERESIS : REAL := 1.5;
+    MAX_MOVE_TIME : INT := 3000;
+
+    encoderCount : DINT := 0;
+    prevEncoderA : BOOL := FALSE;
+
+    gLocalTargetAngle : REAL := 0.0; (* local copy of target from Modbus *)
+
+    motorFwd : BOOL := FALSE;
+    motorRev : BOOL := FALSE;
+    isPositioned : BOOL := FALSE;
+    moveTimer : INT := 0;
+
+    (* Modbus / COM-service variables (library types) *)
+    Settings : COMSETTINGS_FALLBACK; (* fallback type when SysLibCom.lib types are not visible; replace with COMSETTINGS if library exports it *)
+    COM_SERVICE1 : COM_SERVICE; (* ComService.lib FB instance *)
+    getHold : MB_RD_HOLD_REGS; (* modbus.lib FB instance for Read Holding Registers *)
+
+    Buffer : ARRAY[0..255] OF BYTE;
+    cmpl : BOOL;
+    excep : BYTE;
+    DataSize : WORD;
+    TimeOut : TIME := T#50ms;
+    port_opened : BYTE := 0; (* 0=closed,2=opened *)
+    enabl : BOOL := TRUE; (* enable for modbus FBs *)
+
+    (* local temporaries used to unpack returned registers *)
+    tmp_dw : DWORD;
+    tmpFloat : REAL;
+    tmpHi : WORD;
+    tmpLo : WORD;
+    tmpDiff : REAL := 0.0; (* local diff variable declared here *)
+END_VAR
+
+(* @END_DECLARATION := '0' *)
+(* --- COM port initialization using COM_SERVICE FB --- *)
+IF port_opened = 0 THEN
+    (* configure COM port parameters using SysLibCom.COMSETTINGS structure fields *)
+    Settings.Port := COM1; (* use COM1 (PORTS enum from SysLibCom.lib) *)
+    Settings.dwBaudRate := 9600;
+    Settings.byParity := 0;
+    Settings.byStopBits := 0;
+    Settings.dwTimeout := 100;
+    Settings.dwBufferSize := 0;
+    Settings.dwScan := 0;
+
+    (* call COM_SERVICE to open the port; library defines required interface *)
+    COM_SERVICE1(Enable := (port_opened = 0), Settings := Settings, Task := 0);
+    IF COM_SERVICE1.ready THEN
+        port_opened := 2;
+    END_IF;
+END_IF;
+
+(* --- Modbus: read holding registers from ESP slave when port opened --- *)
+IF port_opened = 2 THEN
+    getHold(
+        Enable := enabl,
+        Mode := MB_RTU,
+        DevAddr := 1,
+        FirstAddr := 0,
+        Quantity := 11,
+        ComHandle := DWORD(Settings.Port), (* pass port as DWORD or replace with COM_SERVICE1.Handle if available *),
+        TimeOut := TimeOut,
+        Buffer := Buffer,
+        Complete => cmpl,
+        Exception => excep,
+        ByteCnt => DataSize
+    );
+
+    IF cmpl AND (excep = 0) THEN
+        (* unpack target angle (REAL) from registers 0..1 (hi/lo) - big-endian register order used in examples *)
+        tmpHi := Buffer[0];
+        tmpLo := Buffer[1];
+        tmp_dw := SHL(DWORD(tmpHi),16) OR DWORD(tmpLo);
+        tmpFloat := DWORD_TO_REAL(tmp_dw);
+        gLocalTargetAngle := tmpFloat;
+
+        (* unpack current angle registers 2..3 if needed *)
+        tmpHi := Buffer[2];
+        tmpLo := Buffer[3];
+        tmp_dw := SHL(DWORD(tmpHi),16) OR DWORD(tmpLo);
+        (* optional: set gCurrentAngle if you prefer to trust Modbus reading over encoder-derived value *)
+        (* gCurrentAngle := DWORD_TO_REAL(tmp_dw); *)
+    END_IF;
+END_IF;
+
+(* --- Encoder handling & position control --- *)
+IF gEncoderA AND NOT prevEncoderA THEN
+    IF gEncoderB THEN
+        encoderCount := encoderCount - 1;
+    ELSE
+        encoderCount := encoderCount + 1;
+    END_IF;
+END_IF;
+IF NOT gEncoderA AND prevEncoderA THEN
+    IF gEncoderB THEN
+        encoderCount := encoderCount + 1;
+    ELSE
+        encoderCount := encoderCount - 1;
+    END_IF;
+END_IF;
+prevEncoderA := gEncoderA;
+
+(* angle calculation: one pulse equals one degree as requested *)
+gEncoderCount := encoderCount; (* copy for external visibility / Modbus *)
+gCurrentAngle := DINT_TO_REAL((encoderCount MOD 360 + 360) MOD 360) * ANGLE_PER_COUNT;
+
+(* simple target normalization to 0..360 *)
+IF gLocalTargetAngle < 0.0 THEN
+    gLocalTargetAngle := gLocalTargetAngle + 360.0;
+END_IF;
+WHILE gLocalTargetAngle >= 360.0 DO
+    gLocalTargetAngle := gLocalTargetAngle - 360.0;
+END_WHILE;
+
+(* compute difference -180..180 *)
+tmpDiff := gLocalTargetAngle - gCurrentAngle;
+IF tmpDiff > 180.0 THEN
+    tmpDiff := tmpDiff - 360.0;
+ELSIF tmpDiff < -180.0 THEN
+    tmpDiff := tmpDiff + 360.0;
+END_IF;
+
+(* position control logic using tmpDiff and HYSTERESIS *)
+IF gDI_8 AND NOT gDI_9 AND (gCommand <> 2) THEN (* motorEnable and not alarm *)
+    IF ABS(tmpDiff) <= HYSTERESIS THEN
+        motorFwd := FALSE;
+        motorRev := FALSE;
+        isPositioned := TRUE;
+        moveTimer := 0;
+        gStatus := 2;
+        IF gErrorCode = 1 THEN
+            gErrorCode := 0;
+        END_IF;
+    ELSE
+        isPositioned := FALSE;
+        gStatus := 1;
+        IF tmpDiff > 0.0 THEN
+            motorFwd := TRUE; motorRev := FALSE;
+        ELSE
+            motorFwd := FALSE; motorRev := TRUE;
+        END_IF;
+        moveTimer := moveTimer + 1;
+        IF moveTimer > MAX_MOVE_TIME THEN
+            motorFwd := FALSE; motorRev := FALSE;
+            gErrorCode := 1; gStatus := 0;
+        END_IF;
+    END_IF;
+ELSE
+    motorFwd := FALSE; motorRev := FALSE;
+    IF NOT gDI_9 THEN gStatus := 0; END_IF;
+END_IF;
+
+(* command stop *)
+IF gCommand = 2 THEN motorFwd := FALSE; motorRev := FALSE; gStatus := 0; END_IF;
+
+(* test button: set all DOs when gDI_7 pressed *)
+IF gDI_7 THEN
+    gDO_1 := TRUE; gDO_2 := TRUE; gDO_3 := TRUE; gDO_4 := TRUE;
+    gDO_5 := TRUE; gDO_6 := TRUE; gDO_7 := TRUE; gDO_8 := TRUE;
+ELSE
+    gDO_1 := motorFwd; gDO_2 := motorRev; gDO_3 := isPositioned;
+END_IF;
+END_PROGRAM
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+
+(* Removed duplicated COMSETTINGS stub and obsolete ModbusMasterPoll POU from exported file. Use library instances (COM_SERVICE, MB_RD_HOLD_REGS) inside `PLC_PRG` instead. *)
+(* @END_DECLARATION := '0' *)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Global_Variables' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+VAR_GLOBAL
+    (* Fast discrete inputs (encoder) *)
+    gEncoderA   AT %IX0.0 : BOOL;    (* DI1 - Encoder A (fast input) *)
+    gEncoderB   AT %IX0.1 : BOOL;    (* DI2 - Encoder B (fast input) *)
+
+    (* ModBus (Master) system/channel variables exposed by device configuration *)
+    gModbus_Master_Channel AT %QD6.0 : DWORD; (* ModBus Master: channel/last address (Q area) *)
+    gModbus_Master_LastError AT %QW6.1 : WORD; (* ModBus Master: last error code (Q area) *)
+
+    (* Discrete inputs (DI3..DI18) mapped to %IX1.0.0 - %IX1.1.7 *)
+    gDI_3  AT %IX1.0.0 : BOOL; (* DI3 *)
+    gDI_4  AT %IX1.0.1 : BOOL; (* DI4 *)
+    gDI_5  AT %IX1.0.2 : BOOL; (* DI5 *)
+    gDI_6  AT %IX1.0.3 : BOOL; (* DI6 *)
+    gDI_7  AT %IX1.0.4 : BOOL; (* DI7 *)
+    gDI_8  AT %IX1.0.5 : BOOL; (* DI8 *)
+    gDI_9  AT %IX1.0.6 : BOOL; (* DI9 *)
+    gDI_10 AT %IX1.0.7 : BOOL; (* DI10 *)
+    gDI_11 AT %IX1.1.0 : BOOL; (* DI11 *)
+    gDI_12 AT %IX1.1.1 : BOOL; (* DI12 *)
+    gDI_13 AT %IX1.1.2 : BOOL; (* DI13 *)
+    gDI_14 AT %IX1.1.3 : BOOL; (* DI14 *)
+    gDI_15 AT %IX1.1.4 : BOOL; (* DI15 *)
+    gDI_16 AT %IX1.1.5 : BOOL; (* DI16 *)
+    gDI_17 AT %IX1.1.6 : BOOL; (* DI17 *)
+    gDI_18 AT %IX1.1.7 : BOOL; (* DI18 *)
+
+    (* Discrete outputs - relay DO1..DO8 mapped to %QX3.0.0..%QX3.0.7 *)
+    gDO_1 AT %QX3.0.0 : BOOL;  (* DO1 - Forward *)
+    gDO_2 AT %QX3.0.1 : BOOL;  (* DO2 - Reverse *)
+    gDO_3 AT %QX3.0.2 : BOOL;  (* DO3 - In position indicator *)
+    gDO_4 AT %QX3.0.3 : BOOL;  (* DO4 *)
+    gDO_5 AT %QX3.0.4 : BOOL;  (* DO5 *)
+    gDO_6 AT %QX3.0.5 : BOOL;  (* DO6 *)
+    gDO_7 AT %QX3.0.6 : BOOL;  (* DO7 *)
+    gDO_8 AT %QX3.0.7 : BOOL;  (* DO8 *)
+
+    (* Fast/transistor discrete outputs DO9..DO12 mapped to %QX2.0..%QX2.3 (fast outputs module) *)
+    gDO_9  AT %QX2.0 : BOOL; (* DO9  - fast/transistor output *)
+    gDO_10 AT %QX2.1 : BOOL; (* DO10 *)
+    gDO_11 AT %QX2.2 : BOOL; (* DO11 *)
+    gDO_12 AT %QX2.3 : BOOL; (* DO12 *)
+
+    (* Variables for Modbus and internal state (no AT) *)
+    (*
+        Modbus (holding) register map served by ESP (slave):
+        Register numbers (offset 0):
+        0-1   : target angle (REAL)            (REG_TARGET_ANGLE_HI/LO)
+        2-3   : current angle (REAL)           (REG_CURRENT_ANGLE_HI/LO)
+        4-5   : reserved
+        6     : status (WORD)                  (0=Stop,1=Moving,2=In position)
+        7     : error code (WORD)
+        8     : command (WORD)                 (1=Start,2=Stop,3=Calib)
+        9-10  : encoder count (DINT, hi/lo)
+        11    : PPR (WORD)
+        12    : quad mode (WORD)
+        13    : max time (WORD)
+        14-15 : hysteresis (REAL)
+    *)
+    gTargetAngle : REAL := 45.0;    (* target angle, degrees *)
+    gCurrentAngle : REAL := 0.0;    (* current angle, degrees *)
+    gAngleFromStart : REAL := 0.0;  (* angle from program start *)
+    gStatus : INT := 0;             (* 0=Stop,1=Moving,2=In position *)
+    gErrorCode : INT := 0;          (* 0=OK,1=Timeout,2=Fault *)
+    gCommand : INT := 0;            (* 1=Start,2=Stop,3=Calibrate *)
+    gEncoderCount : DINT := 0;     (* encoder counter for Modbus *)
+
+    (* Calibration / Modbus helper variables *)
+    gStartCalib : BOOL := FALSE;
+    gCalibRunning : BOOL := FALSE;
+    gCalibStatus : INT := 0;
+    gCalibRevsDone : INT := 0;
+    gCalibRevsTarget : INT := 3;
+    gCalibMeasured : REAL := 0.0;
+    gCalibCountsPerRev : DINT := 0;
+END_VAR
+(* @OBJECT_END := 'Global_Variables' *)
+(* @CONNECTIONS := Global_Variables
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Variable_Configuration' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+VAR_CONFIG
+END_VAR
+
+(* @OBJECT_END := 'Variable_Configuration' *)
+(* @CONNECTIONS := Variable_Configuration
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)
+
+PLC_CONFIGURATION
+_GLOBAL
+_VERSION: 3
+_AUTOADR: 1
+_CHECKADR: 1
+_SAVECONFIGFILESINPROJECT: 0
+_END_GLOBAL
+
+_MODULE: '3S'
+_SECTION_NAME: 'Root'
+_INDEX_IN_PARENT: '-1'
+_MODULE_NAME: 'PLC110_30'
+_NODE_ID: -1
+_IECIN: %IB0
+_IECOUT: %QB0
+_IECDIAG: %MB0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'PLC110-30_v2'
+_PARAM 2: 0, '1'
+_PARAM 3: 0, '1000'
+_END_PARAMETER
+
+_MODULE: '3S'
+_SECTION_NAME: 'I_SIMPLE_INPUT'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Fast discrete inputs'
+_NODE_ID: 0
+_IECIN: %IB0
+_IECOUT: %QB0
+_IECDIAG: %MB0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Fast discrete inputs'
+_PARAM 2: 0, '10000'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Дискретный вход 1'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX0.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Дискретный вход 2'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX0.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID130'
+_INDEX_IN_PARENT: '2'
+_MODULE_NAME: 'Дискретные входы - 16'
+_NODE_ID: 1
+_IECIN: %IB1
+_IECOUT: %QB1
+_IECDIAG: %MB1
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Дискретные входы'
+_PARAM 2: 0, '10'
+_PARAM 3: 0, '16'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ByteInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 дискретных входов'
+_CHANNEL_MODE: 'I'
+_IECADR: %IB1.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %IX1.0.0 '' 'Бит 0'
+_BIT 1: %IX1.0.1 '' 'Бит 1'
+_BIT 2: %IX1.0.2 '' 'Бит 2'
+_BIT 3: %IX1.0.3 '' 'Бит 3'
+_BIT 4: %IX1.0.4 '' 'Бит 4'
+_BIT 5: %IX1.0.5 '' 'Бит 5'
+_BIT 6: %IX1.0.6 '' 'Бит 6'
+_BIT 7: %IX1.0.7 '' 'Бит 7'
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'ByteInput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 дискретных входов'
+_CHANNEL_MODE: 'I'
+_IECADR: %IB1.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %IX1.1.0 '' 'Бит 0'
+_BIT 1: %IX1.1.1 '' 'Бит 1'
+_BIT 2: %IX1.1.2 '' 'Бит 2'
+_BIT 3: %IX1.1.3 '' 'Бит 3'
+_BIT 4: %IX1.1.4 '' 'Бит 4'
+_BIT 5: %IX1.1.5 '' 'Бит 5'
+_BIT 6: %IX1.1.6 '' 'Бит 6'
+_BIT 7: %IX1.1.7 '' 'Бит 7'
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'OWEN_ID570'
+_INDEX_IN_PARENT: '3'
+_MODULE_NAME: 'Быстрые дискретные выходы'
+_NODE_ID: 2
+_IECIN: %IB2
+_IECOUT: %QB2
+_IECDIAG: %MB2
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Быстрые дискретные выходы'
+_PARAM 2: 0, 'FALSE'
+_PARAM 3: 0, 'FALSE'
+_PARAM 4: 0, 'FALSE'
+_PARAM 5: 0, 'FALSE'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Быстрый дискретный выход 1'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Быстрый дискретный выход 2'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '3'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Быстрый дискретный выход 3'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.2
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '4'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Быстрый дискретный выход 4'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.3
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID131'
+_INDEX_IN_PARENT: '4'
+_MODULE_NAME: 'Дискретные выходы - 8'
+_NODE_ID: 3
+_IECIN: %IB3
+_IECOUT: %QB3
+_IECDIAG: %MB3
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Дискретные выходы'
+_PARAM 2: 0, '0'
+_PARAM 3: 0, 'No'
+_PARAM 4: 0, '10'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ByteOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 дискретных выходов'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QB3.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %QX3.0.0 '' 'Бит 0'
+_BIT 1: %QX3.0.1 '' 'Бит 1'
+_BIT 2: %QX3.0.2 '' 'Бит 2'
+_BIT 3: %QX3.0.3 '' 'Бит 3'
+_BIT 4: %QX3.0.4 '' 'Бит 4'
+_BIT 5: %QX3.0.5 '' 'Бит 5'
+_BIT 6: %QX3.0.6 '' 'Бит 6'
+_BIT 7: %QX3.0.7 '' 'Бит 7'
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID103'
+_INDEX_IN_PARENT: '5'
+_MODULE_NAME: 'Специальный вход'
+_NODE_ID: 4
+_IECIN: %IB4
+_IECOUT: %QB4
+_IECDIAG: %MB4
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Специальный вход'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Специальный вход'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX4.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID104'
+_INDEX_IN_PARENT: '6'
+_MODULE_NAME: 'Специальный выход'
+_NODE_ID: 5
+_IECIN: %IB5
+_IECOUT: %QB5
+_IECDIAG: %MB5
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Специальный выход'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Специальный выход'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX5.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'MODBUS_MASTER_ID450'
+_INDEX_IN_PARENT: '7'
+_MODULE_NAME: 'ModBus (Master)'
+_NODE_ID: 6
+_IECIN: %IB6
+_IECOUT: %QB6
+_IECDIAG: %MB6
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'ModBus (Master)'
+_PARAM 2: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'DWordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Last address'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QD6.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Last error'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_MODULE: '3S'
+_SECTION_NAME: 'COM1_USART'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'RS-485-1'
+_NODE_ID: 0
+_IECIN: %IB6.0
+_IECOUT: %QB6.0
+_IECDIAG: %MB6.0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'RS-485-1'
+_PARAM 2: 0, '9600'
+_PARAM 3: 0, 'NO PARITY CHECK'
+_PARAM 4: 0, '8 bits'
+_PARAM 5: 0, 'One stop bit'
+_PARAM 6: 0, 'RS485'
+_PARAM 7: 0, 'ASCII'
+_PARAM 8: 0, '0'
+_PARAM 9: 0, 'No'
+_END_PARAMETER
+_END_MODULE
+_END_MODULE
+_END_MODULE
+PLC_END
+
+
+RESOURCE
+{event_task : 'start','Called when program starts','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,1,27847}
+{event_task : 'stop','Called when program stops','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,2,27847}
+{event_task : 'before_reset','Called before reset takes place','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,3,27847}
+{event_task : 'after_reset','Called after reset took place','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,4,27847}
+{event_task : 'debug_loop','Debug loop at breakpoint','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,31,27847}
+{event_task : 'Timer','Timer(20mks)(only in PLC110)','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,1000,27847}
+
+END_RESOURCE
+
+
+_ALARMCONFIG
+_ALARMCONFIGNEXTTEXTID : 10002
+_ALARMCONFIGFORMATS : 'HH$':$'mm$':$'ss','dd$'-$'MM$'-$'yyyy'
+_ALARMCLASSLIST : 1
+_ALARMCLASSID : 0
+_ALARMCLASSACKTYPE : 0
+_ALARMCLASSNAME : 'DEFAULT'
+_ALARMCLASSDESCRIPTION : ''
+_ALARMCLASSBGCOLORS : 16777215,16777215,16777215
+_ALARMCLASSTEXTCOLORS : 3394560,255,16711680
+_ALARMCLASSBITMAPS : '','',''
+_ALARMACTIONLIST : 0
+(* @ALARMCLASSRESETCOLORS := '_ALARMCLASSRESETCOLORS: 33023,16777215' *)
+(* @ALARMCLASSRESETBITMAP := '_ALARMCLASSRESETBITMAP: $'$'' *)
+_ALARMGROUPLISTNAME : 'Группы'
+_ALARMGROUPPATH : 'Группы'
+_ALARMGROUPLIST : 0
+_VISUALSETTINGSFLAGS : 0,0,0,0
+_VISUALSETTINGSFLAGS : '','',''
+_VISUALSETTINGSDYNTEXTFILECOUNT : 0
+
+(* @ALARMCONFIGFLAGS := '_ALARMCONFIGFLAGS: 4' *)
+(* @ALARMCONFIGGLOBALDB_STR := '_ALARMCONFIGGLOBALDB_STRINGS: $'$',$'$',$'$',$'$'' *)
+(* @ALARMCONFIGGLOBALDB_NUM := '_ALARMCONFIGGLOBALDB_NUMBERS: 0,0' *)
+_END_ALARMCONFIG
+
+
+LIBRARY
+ANALYZATION.LIB 5.10.99 09:05:06
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 2
+AnalyzeExpression: 0
+AppendErrorString: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+LIBRARY
+ComService.lib 21.5.09 14:28:28
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 1
+COM_SERVICE: 2048
+NumOfGVLs: 1
+Global_Variables: 2048
+END_LIBRARY
+
+LIBRARY
+IECSFC.LIB 13.4.06 15:51:28
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 1
+SFCActionControl: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+LIBRARY
+modbus.lib 27.5.09 09:22:38
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 17
+MB_ASCII_RX: 2048
+MB_ASCII_TX: 2048
+MB_CRC: 2048
+MB_ENC_CHAR: 2048
+MB_LCR: 2048
+MB_MOVED: 2048
+MB_MOVER: 2048
+MB_RD_COILS: 2048
+MB_RD_HOLD_REGS: 2048
+MB_RD_INP_REGS: 2048
+MB_RD_INPUTS: 2048
+MB_RTU_RX: 2048
+MB_UNI_IO: 2048
+MB_WR_COILS: 2048
+MB_WR_REGS: 2048
+MB_WR_SNG_COIL: 2048
+MB_WR_SNG_REG: 2048
+NumOfGVLs: 1
+Global_Variables: 2048
+END_LIBRARY
+
+LIBRARY
+STANDARD.LIB 4.10.05 11:14:46
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 21
+CONCAT: 0
+CTD: 0
+CTU: 0
+CTUD: 0
+DELETE: 0
+F_TRIG: 0
+FIND: 0
+INSERT: 0
+LEFT: 0
+LEN: 0
+MID: 0
+R_TRIG: 0
+REPLACE: 0
+RIGHT: 0
+RS: 0
+RTC: 0
+SEMA: 0
+SR: 0
+TOF: 0
+TON: 0
+TP: 0
+NumOfGVLs: 0
+END_LIBRARY
+
+LIBRARY
+SysLibCom.lib 20.2.06 12:31:08
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 7
+SysComClose: 0
+SysComGetVersion2300: 0
+SysComOpen: 0
+SysComRead: 0
+SysComSetSettings: 0
+SysComSetSettingsEx: 0
+SysComWrite: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+
+
+_WORKSPACE
+_GLOBALVISUALSETTINGS
+_VISUALSETTINGSFLAGS : 0,0,0,0
+_VISUALSETTINGSFLAGS : '','',''
+_VISUALSETTINGSDYNTEXTFILECOUNT : 0
+_VISUALBITMAPLISTCOUNT : 0
+_END_GLOBALVISUALSETTINGS
+_END_WORKSPACE

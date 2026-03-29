@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>05. Кинематика осей — Трубогиб ЧПУ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <strong>ТРУБОГИБ ЧПУ</strong>
+      <span>Мануал v2.1</span>
+    </div>
+    <div class="sidebar-section">Навигация</div>
+    <a href="index.html">&#127968; Главная</a>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Разделы</div>
+    <a href="01_vfd_delta_cp2000.html">01. Привод VFD (Delta CP2000)</a>
+    <a href="02_plc_owen.html">02. ПЛК Owen + Энкодер</a>
+    <a href="03_servo_mitsubishi.html">03. Сервоприводы Mitsubishi</a>
+    <a href="04_control_bridge.html">04. Интеграционный слой</a>
+    <a href="05_mechanics.html" class="active">05. Кинематика осей</a>
+    <a href="06_software_runtime.html">06. ПО и запуск</a>
+  </nav>
+
+  <div class="main-content">
+    <header>
+      <div class="container">
+        <h1>05. Кинематика осей Z и C</h1>
+        <div class="subtitle">Расчёты передаточных чисел, разрешения, люфта. Шестерни Z35/Z105, рейка M2, редукторы PF115.</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <nav class="breadcrumb">
+        <a href="index.html">Главная</a> <span>&rsaquo;</span> 05. Кинематика осей
+      </nav>
+
+      <h2>1. Ось Z — линейная подача каретки</h2>
+
+      <h3>1.1. Кинематическая схема</h3>
+      <pre><code>HG-SN152J (2000 об/мин)
+  │
+  ▼
+PF115L1-008 (редуктор 1:8)
+  │  Вых. вал Ø32 мм
+  ▼
+Шестерня Z35, M2 (d_дел = 70 мм)
+  │  Зацепление с рейкой
+  ▼
+Рейка прямозубая M2, L = 6000 мм
+  │
+  ▼
+Каретка HGH20CA × 4 шт на рельсах HGR20 × 2 шт</code></pre>
+
+      <h3>1.2. Расчёт кинематики (ось Z)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Формула</th><th>Результат</th></tr>
+        <tr>
+          <td>Делительный диаметр Z35</td>
+          <td class="mono">d = m × Z = 2 × 35</td>
+          <td class="bold">d = 70 мм</td>
+        </tr>
+        <tr>
+          <td>Длина окружности делит. круга</td>
+          <td class="mono">C = π × d = π × 70</td>
+          <td class="bold">C = 219.91 мм</td>
+        </tr>
+        <tr class="key-row">
+          <td><strong>Ход на 1 оборот вала двигателя</strong></td>
+          <td class="mono">219.91 / i_ред = 219.91 / 8</td>
+          <td class="bold">27.49 мм/оборот двиг.</td>
+        </tr>
+        <tr>
+          <td>Макс. скорость каретки (2000 об/мин)</td>
+          <td class="mono">27.49 × 2000 / 60</td>
+          <td>916 мм/с</td>
+        </tr>
+        <tr>
+          <td>Рабочая скорость (300 мм/с) в об/мин</td>
+          <td class="mono">300 / 27.49 × 60</td>
+          <td>655 об/мин двиг.</td>
+        </tr>
+        <tr>
+          <td>Разрешение (262144 имп/об, редуктор 1:8)</td>
+          <td class="mono">219.91 / (262144 × 8)</td>
+          <td>0.000105 мм/импульс</td>
+        </tr>
+        <tr>
+          <td>Тяговое усилие (7.16 Н·м × 1:8 / r_шест.)</td>
+          <td class="mono">7.16 × 8 × 0.95 / 0.035</td>
+          <td>≈ 1551 Н (158 кгс)</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>1.3. Параметры шестерни Z35 (M2)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Формула</th><th>Значение</th></tr>
+        <tr><td>Модуль</td><td>—</td><td class="bold">m = 2</td></tr>
+        <tr><td>Число зубьев</td><td>—</td><td class="bold">Z = 35</td></tr>
+        <tr><td>Делительный диаметр</td><td class="mono">d = m × Z</td><td>70 мм</td></tr>
+        <tr><td>Диаметр вершин</td><td class="mono">da = d + 2m</td><td>74 мм</td></tr>
+        <tr class="key-row">
+          <td><strong>Диаметр впадин</strong></td>
+          <td class="mono">df = d − 2.5m</td>
+          <td class="bold">65 мм</td>
+        </tr>
+        <tr class="key-row">
+          <td><strong>Посадочное отверстие</strong></td>
+          <td>—</td>
+          <td class="bold">Ø25 мм (шпонка, стенка 20 мм — OK)</td>
+        </tr>
+        <tr><td>Шаг зубьев (по делит. окружности)</td><td class="mono">p = π × m</td><td>6.28 мм</td></tr>
+      </table>
+      </div>
+
+      <div class="alert alert-info">
+        <strong>Почему Z35, а не Z20?</strong>
+        Z20 M2: df = 35 мм, вал Ø25 → стенка всего 5 мм → разрушится при нагрузке.
+        Z35 M2: df = 65 мм, вал Ø25 → стенка 20 мм → надёжно.
+      </div>
+
+      <h3>1.4. Компенсация люфта рейки (ось Z)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Метод</th><th>Люфт</th><th>Сложность</th><th>Применение</th></tr>
+        <tr><td>Без компенсации (прямозубая рейка)</td><td>0.05–0.1 мм</td><td>—</td><td>Гибка труб (достаточно)</td></tr>
+        <tr class="key-row">
+          <td><strong>Программная компенсация в EXE/Teensy</strong></td>
+          <td>0 (виртуально)</td>
+          <td>Низкая</td>
+          <td>Гибка + лазерная резка</td>
+        </tr>
+        <tr>
+          <td>Подпружиненная разрезная шестерня</td>
+          <td>&lt; 0.01 мм</td>
+          <td>Средняя</td>
+          <td>Лазерная резка (рекомендуется)</td>
+        </tr>
+        <tr>
+          <td>Косозубая рейка + шестерня</td>
+          <td>0.02–0.05 мм</td>
+          <td>Средняя</td>
+          <td>Повышенная плавность</td>
+        </tr>
+      </table>
+      </div>
+
+      <h2>2. Ось C — вращение патрона</h2>
+
+      <h3>2.1. Кинематическая схема</h3>
+      <pre><code>HG-SN152J (2000 об/мин)
+  │
+  ▼
+PF115L2-020 (планетарный редуктор 1:20)
+  │  Вых. вал Ø32 мм
+  ▼
+Шестерня Z35, M2 (пиньон, d_дел = 70 мм)
+  │  Зацепление Z35 → Z105
+  ▼
+Шестерня Z105, M2 (d_дел = 210 мм) — одновременно фланец патрона
+  │  Посадочный буртик Ø165 H7 + 3×М10 на PCD 174 мм
+  ▼
+Патрон токарный Р3700 (7100-0007В ГОСТ 2675-80), Ø200 мм</code></pre>
+
+      <h3>2.2. Расчёт кинематики (ось C)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Формула</th><th>Результат</th></tr>
+        <tr>
+          <td>Передат. число редуктора</td>
+          <td>—</td>
+          <td class="bold">i₁ = 20</td>
+        </tr>
+        <tr>
+          <td>Передат. число зубчатой пары</td>
+          <td class="mono">i₂ = Z105 / Z35</td>
+          <td class="bold">i₂ = 3</td>
+        </tr>
+        <tr class="key-row">
+          <td><strong>Суммарное передат. число</strong></td>
+          <td class="mono">i = i₁ × i₂ = 20 × 3</td>
+          <td class="bold">i = 60:1</td>
+        </tr>
+        <tr>
+          <td>Скорость патрона (при 2000 об/мин двиг.)</td>
+          <td class="mono">2000 / 60</td>
+          <td>33.3 об/мин (≈ 200°/с)</td>
+        </tr>
+        <tr>
+          <td>Рабочая скорость (120°/с)</td>
+          <td class="mono">120 / 360 × 60 × 60</td>
+          <td>1200 об/мин двиг.</td>
+        </tr>
+        <tr>
+          <td>Момент на патроне</td>
+          <td class="mono">7.16 × 20 × 0.92</td>
+          <td>≈ 131.7 Н·м</td>
+        </tr>
+        <tr>
+          <td>Разрешение позиционирования</td>
+          <td class="mono">360° / (262144 × 60)</td>
+          <td>0.0000229°/импульс</td>
+        </tr>
+        <tr>
+          <td>Межосевое расстояние Z35/Z105</td>
+          <td class="mono">(70 + 210) / 2</td>
+          <td class="bold">140 мм</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>2.3. Параметры шестерни Z105 (M2) — фланец патрона</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Модуль / Число зубьев</td><td class="bold">M2 / Z=105</td></tr>
+        <tr><td>Делительный диаметр</td><td>210 мм</td></tr>
+        <tr><td>Диаметр вершин</td><td class="bold">214 мм</td></tr>
+        <tr><td>Диаметр впадин</td><td class="bold">205 мм</td></tr>
+        <tr class="key-row"><td>Посадочный буртик для патрона</td><td class="bold">Ø165 H7 (центрирование)</td></tr>
+        <tr class="key-row"><td>Крепление патрона</td><td class="bold">3× отв. Ø11 (под М10) на PCD 174 мм, шаг 120°</td></tr>
+        <tr><td>Центральное отверстие</td><td class="bold">Ø50 мм (сквозное)</td></tr>
+        <tr><td>Биение после установки</td><td>≤ 0.03 мм (для лазерной резки)</td></tr>
+      </table>
+      </div>
+
+      <h3>2.4. Анализ люфта оси C</h3>
+
+      <div class="alert alert-warn">
+        <strong>Суммарный люфт схемы «планетарный редуктор + открытая зубчатая пара»: до 10 угловых минут.</strong>
+        При R=100 мм (труба Ø200 мм): люфт 10' → погрешность 0.29 мм.
+        Для гибки труб — приемлемо. Для лазерной резки — критично!
+      </div>
+
+      <div class="table-wrap">
+      <table>
+        <tr><th>Источник люфта</th><th>Величина</th><th>Решение</th></tr>
+        <tr><td>Планетарный редуктор PF115L2-020</td><td>≤ 15 arcmin</td><td>Выбирать редуктор с меньшим люфтом</td></tr>
+        <tr><td>Зубчатая пара Z35/Z105</td><td>3–5 arcmin</td><td>Подпружиненная разрезная шестерня Z105</td></tr>
+        <tr class="key-row">
+          <td><strong>Суммарный люфт</strong></td>
+          <td class="bold">до 10 arcmin</td>
+          <td><strong>Допустим для гибки, недопустим для лазерной резки</strong></td>
+        </tr>
+      </table>
+      </div>
+
+      <h2>3. Патрон Р3700 (7100-0007В ГОСТ 2675-80)</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Наружный диаметр</td><td>200 мм</td></tr>
+        <tr><td>Диапазон зажима (прямые кулачки)</td><td>8–140 мм</td></tr>
+        <tr><td>Диапазон зажима (обратные кулачки)</td><td>90–200 мм</td></tr>
+        <tr><td>Высота патрона</td><td>125 мм</td></tr>
+        <tr class="key-row"><td>Центральное отверстие</td><td class="bold">Ø50 мм (сквозное — для трубы)</td></tr>
+        <tr class="key-row"><td>Посадочный буртик</td><td class="bold">Ø165 H7</td></tr>
+        <tr class="key-row"><td>Крепление</td><td class="bold">3 болта М10 на PCD 174 мм</td></tr>
+        <tr><td>Масса</td><td>17 кг</td></tr>
+      </table>
+      </div>
+
+      <h2>4. Редукторы PF115</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>PF115L1-008 (ось Z)</th><th>PF115L2-020 (ось C)</th></tr>
+        <tr><td>Тип</td><td>Планетарный 1-ступ.</td><td>Планетарный 2-ступ.</td></tr>
+        <tr><td>Передат. число</td><td class="bold">1:8</td><td class="bold">1:20</td></tr>
+        <tr><td>Входной фланец</td><td>115 мм (под HG-SN152J)</td><td>115 мм (под HG-SN152J)</td></tr>
+        <tr><td>Входной вал</td><td>Ø22 мм, шпонка</td><td>Ø22 мм, шпонка</td></tr>
+        <tr><td>Выходной вал</td><td>Ø32 мм, шпонка</td><td>Ø32 мм, шпонка</td></tr>
+        <tr><td>Номинальный момент</td><td>200 Н·м</td><td>400 Н·м</td></tr>
+        <tr><td>КПД</td><td>≈ 95%</td><td>≈ 92%</td></tr>
+        <tr><td>Люфт</td><td>≤ 10 arcmin</td><td>≤ 15 arcmin</td></tr>
+      </table>
+      </div>
+
+      <h2>5. Программная компенсация люфта (Backlash Compensation)</h2>
+
+      <p>В Teensy и EXE предусмотрена программная компенсация люфта: при смене направления движения оси делается «сверхшаг» на величину люфта перед записью целевой позиции. Это устраняет мёртвую зону без механических изменений.</p>
+
+      <pre><code>Настройки (вводятся в EXE или прошивке Teensy):
+  BACKLASH_Z = 0.1 мм   (мёртвая зона рейки)
+  BACKLASH_C = 0.05°    (мёртвая зона зубчатой пары)
+
+Алгоритм (при смене направления):
+  Если direction != prev_direction:
+    steps_extra = BACKLASH / step_resolution
+    Move(steps_extra, direction)  // "выбрать" люфт
+  Move(target_steps, direction)   // целевое перемещение</code></pre>
+
+      <footer>Трубогиб ЧПУ — Мануал v2.1 | Март 2026</footer>
+    </div>
+  </div>
+</div>
+</body>
+</html>

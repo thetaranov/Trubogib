@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>03. Сервоприводы Mitsubishi — Трубогиб ЧПУ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <strong>ТРУБОГИБ ЧПУ</strong>
+      <span>Мануал v2.1</span>
+    </div>
+    <div class="sidebar-section">Навигация</div>
+    <a href="index.html">&#127968; Главная</a>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Разделы</div>
+    <a href="01_vfd_delta_cp2000.html">01. Привод VFD (Delta CP2000)</a>
+    <a href="02_plc_owen.html">02. ПЛК Owen + Энкодер</a>
+    <a href="03_servo_mitsubishi.html" class="active">03. Сервоприводы Mitsubishi</a>
+    <a href="04_control_bridge.html">04. Интеграционный слой</a>
+    <a href="05_mechanics.html">05. Кинематика осей</a>
+    <a href="06_software_runtime.html">06. ПО и запуск</a>
+  </nav>
+
+  <div class="main-content">
+    <header>
+      <div class="container">
+        <h1>03. Сервоприводы Mitsubishi MR-JE-200A</h1>
+        <div class="subtitle">HG-SN152J-S100. CN1 (50-pin). Питание цепей 24В. Step/Dir через MAX490. Оси Z и C.</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <nav class="breadcrumb">
+        <a href="index.html">Главная</a> <span>&rsaquo;</span> 03. Сервоприводы Mitsubishi
+      </nav>
+
+      <div class="alert alert-danger">
+        <strong>CN1 — строго 50-контактный разъём (MIL-C-50)!</strong>
+        Все старые документы с 20-pin CN1 — недействительны. Единственный источник истины:
+        оригинальный мануал MR-JE-A из папки <code>Сервоприводы/</code>. При сомнении — сверяться только с ним.
+      </div>
+
+      <h2>1. Спецификация оборудования</h2>
+
+      <h3>1.1. Серводрайвер MR-JE-200A</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Модель</td><td class="bold mono">MR-JE-200A</td></tr>
+        <tr><td>Серия</td><td>Mitsubishi MR-JE-A (бюджетная, позиционное управление)</td></tr>
+        <tr><td>Мощность</td><td>2 кВт (пиковый)</td></tr>
+        <tr><td>Питание</td><td>1ф 200–240 В AC (L1/L2) или 3ф 200–240 В AC</td></tr>
+        <tr><td>Режим управления</td><td><strong>Position mode (CP) — импульсы Step/Dir</strong></td></tr>
+        <tr><td>Макс. частота Step/Dir</td><td>500 кГц</td></tr>
+        <tr><td>Разъём управления</td><td class="bold">CN1 — 50 пинов (MIL-C-50)</td></tr>
+        <tr><td>Разъём энкодера</td><td>CN2 — 20 пинов (CMV1-R20P)</td></tr>
+        <tr><td>Питание дискретных входов</td><td>12–26.4 В DC</td></tr>
+        <tr><td>Внутренние резисторы входов</td><td><strong>~6 кОм — внешние резисторы НЕ нужны!</strong></td></tr>
+      </table>
+      </div>
+
+      <h3>1.2. Серводвигатель HG-SN152J-S100</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Модель</td><td class="bold mono">HG-SN152J-S100</td></tr>
+        <tr><td>Мощность</td><td>1.5 кВт</td></tr>
+        <tr><td>Номинальная скорость</td><td>2000 об/мин</td></tr>
+        <tr><td>Максимальная скорость</td><td>3000 об/мин</td></tr>
+        <tr><td>Номинальный момент</td><td>7.16 Н·м</td></tr>
+        <tr><td>Пиковый момент</td><td>21.5 Н·м (3× номинал)</td></tr>
+        <tr><td>Энкодер</td><td>262 144 ppr (абсолютный, 18 бит, последовательный)</td></tr>
+        <tr><td>Фланец</td><td>115 мм (NEMA 48)</td></tr>
+        <tr><td>Вал</td><td>Ø22 мм, шпонка</td></tr>
+        <tr><td>Тормоз</td><td>Нет (S100 = без тормоза)</td></tr>
+      </table>
+      </div>
+
+      <h2>2. Эталонная распиновка CN1 (50-pin)</h2>
+
+      <h3>2.1. Ключевые рабочие пины — используются в проекте</h3>
+
+      <div class="table-wrap">
+      <table>
+        <tr><th>Пин</th><th>Сигнал</th><th>Напр.</th><th>Функция</th><th>Подключение</th></tr>
+        <tr class="key-row">
+          <td><span class="pin">10</span></td><td class="mono bold">PP</td><td>Вход</td>
+          <td><strong>STEP (+) — импульсы</strong> (High-speed, RS-422)</td>
+          <td>MAX490 TX+ → пин 10</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">11</span></td><td class="mono bold">PG</td><td>Вход</td>
+          <td><strong>STEP (−) — импульсы</strong> (High-speed, RS-422)</td>
+          <td>MAX490 TX− → пин 11</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">35</span></td><td class="mono bold">NP</td><td>Вход</td>
+          <td><strong>DIR (+) — направление</strong> (High-speed, RS-422)</td>
+          <td>MAX490 TX+ → пин 35</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">36</span></td><td class="mono bold">NG</td><td>Вход</td>
+          <td><strong>DIR (−) — направление</strong> (High-speed, RS-422)</td>
+          <td>MAX490 TX− → пин 36</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">15</span></td><td class="mono bold">SON</td><td>Вход</td>
+          <td><strong>Servo ON</strong> — разрешение работы серво</td>
+          <td>+24В от ПЛК DO7 (Z) / DO8 (C)</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">19</span></td><td class="mono bold">DI0</td><td>Вход</td>
+          <td><strong>EMG (по умолч.) — аварийный стоп</strong></td>
+          <td>+24В → НЗ кнопка E-Stop → DI0</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">43</span></td><td class="mono bold">LSP</td><td>Вход</td>
+          <td><strong>Концевик прямого хода (+)</strong></td>
+          <td>+24В → НЗ концевик → LSP</td>
+        </tr>
+        <tr class="key-row">
+          <td><span class="pin">44</span></td><td class="mono bold">LSN</td><td>Вход</td>
+          <td><strong>Концевик обратного хода (−)</strong></td>
+          <td>+24В → НЗ концевик → LSN</td>
+        </tr>
+        <tr>
+          <td><span class="pin">2</span></td><td class="mono">VC</td><td>—</td>
+          <td>+5В источник (питание внешних оптопар)</td><td>Только 5В нагрузки</td>
+        </tr>
+        <tr>
+          <td><span class="pin">3</span></td><td class="mono">LG</td><td>—</td>
+          <td>Логическая земля</td><td>Общий сигнальной цепи</td>
+        </tr>
+        <tr>
+          <td><span class="pin">20/21</span></td><td class="mono">DICOM</td><td>—</td>
+          <td>Общий для дискретных входов (COM)</td><td>GND (Source mode)</td>
+        </tr>
+        <tr>
+          <td><span class="pin">48</span></td><td class="mono">ALM</td><td>Выход</td>
+          <td>Авария (Alarm output)</td><td>Подтяжка +24В/4.7 кОм</td>
+        </tr>
+        <tr>
+          <td><span class="pin">49</span></td><td class="mono">RD</td><td>Выход</td>
+          <td>Готов (Ready)</td><td>Подтяжка +24В/4.7 кОм</td>
+        </tr>
+        <tr>
+          <td><span class="pin">24</span></td><td class="mono">INP</td><td>Выход</td>
+          <td>В позиции (In-Position)</td><td>Подтяжка +24В/4.7 кОм</td>
+        </tr>
+        <tr>
+          <td><span class="pin">46/47</span></td><td class="mono">DOCOM</td><td>—</td>
+          <td>Общий для дискретных выходов</td><td>→ GND</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>2.2. Дополнительные пины (энкодерные выходы CN1)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Пин</th><th>Сигнал</th><th>Функция</th></tr>
+        <tr><td><span class="pin">4</span></td><td class="mono">LA</td><td>Энкодер A-фаза (+)</td></tr>
+        <tr><td><span class="pin">5</span></td><td class="mono">LAR</td><td>Энкодер A-фаза (−) инверсный</td></tr>
+        <tr><td><span class="pin">6</span></td><td class="mono">LB</td><td>Энкодер B-фаза (+)</td></tr>
+        <tr><td><span class="pin">7</span></td><td class="mono">LBR</td><td>Энкодер B-фаза (−) инверсный</td></tr>
+        <tr><td><span class="pin">8</span></td><td class="mono">LZ</td><td>Энкодер Z-фаза (Index, +)</td></tr>
+        <tr><td><span class="pin">9</span></td><td class="mono">LZR</td><td>Энкодер Z-фаза (−) инверсный</td></tr>
+        <tr><td><span class="pin">42</span></td><td class="mono">EM2</td><td>Forced Stop (принудит. остановка с замедлением)</td></tr>
+      </table>
+      </div>
+
+      <h2>3. Подключение входов 24В (Source mode / PNP)</h2>
+
+      <div class="alert alert-danger">
+        <strong>⚠️ Критично:</strong> сигнальный общий CN1 (0В) и PE (защитная земля) — не одно и то же.
+        Для входов SON/DI0/LSP/LSN используйте только 0В того же 24В БП, который питает цепь управления.
+      </div>
+
+      <div class="alert alert-danger">
+        <strong>Внешние токоограничивающие резисторы НЕ нужны!</strong>
+        Внутри MR-JE-A на входах SON, DI0, LSP, LSN уже установлены резисторы ~6 кОм.
+        Подключение производится напрямую от 24В к пину, общий (GND) подключается на DICOM (пин 20/21).
+        Добавление внешних резисторов снизит ток до ~2.9 мА — это ниже порога оптопары (нужно ~5 мА)!
+      </div>
+
+      <pre><code>Внешний БП +24В (или +25В)
+  │
+  ├──────[НЗ E-Stop] ──────────► DI0   (пин 19)  ← EMG — обрыв = АВАРИЯ СТОП
+  ├──────[НЗ концевик +] ───────► LSP   (пин 43)  ← Лимит вперёд
+  ├──────[НЗ концевик −] ───────► LSN   (пин 44)  ← Лимит назад
+  └──────[ПЛК DO7/DO8 реле] ───► SON   (пин 15)  ← Серво разрешено (24В от ПЛК)
+
+GND (от того же БП)
+  └──────────────────────────────► DICOM (пин 20 и 21) ← Общий входов (Source mode)
+
+⚠ НЗ = нормально замкнутый контакт. Рабочее состояние = цепь ЗАМКНУТА.
+  Нажатие кнопки / срабатывание концевика → цепь РАЗОМКНУТА → СТОП.</code></pre>
+
+      <div class="alert alert-info">
+        <strong>Диагностика синего провода (SON):</strong>
+        в этой эталонной схеме (Source/PNP) при Servo ON на CN1 pin 15 должно быть около +24В относительно 0В.
+        Если там 0В, проверьте подачу +24В на DO7/DO8 и общий 0В на DICOM (20/21).
+      </div>
+
+      <h3>Проверка допустимости при 25В питании</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th><th>Допуск (мануал)</th><th>Итог</th></tr>
+        <tr><td>Напряжение питания</td><td>25 В</td><td>12–26.4 В</td><td class="bold" style="color:#4ade80">✓ В пределах</td></tr>
+        <tr><td>Ток через вход</td><td>11.85 мА</td><td>5–20 мА</td><td class="bold" style="color:#4ade80">✓ Норма</td></tr>
+        <tr><td>Мощность на резисторе</td><td>0.28 Вт</td><td>≤0.25 Вт (типовой)</td><td class="bold" style="color:#fbbf24">⚠ Применить резисторы 0.5 Вт</td></tr>
+      </table>
+      </div>
+
+      <h2>4. Подключение Step/Dir (RS-422, строго 5В)</h2>
+
+      <div class="alert alert-danger">
+        <strong>⛔ КРИТИЧЕСКИ: пины 10, 11, 35, 36 — только RS-422 (5В)!</strong>
+        Запрещена подача 24В или 25В на импульсные входы PP, PG, NP, NG.
+        Подача 24В приведёт к немедленному выгоранию высокоскоростных оптопар CN1!
+        Стандарт: RS-422 дифференциальный, ±(2.5–5)В.
+      </div>
+
+      <h3>Схема подключения Teensy 4.1 → MAX490 → MR-JE-200A</h3>
+      <pre><code>Teensy 4.1 (3.3В)       MAX490 (RS-422, 5В)    MR-JE-200A CN1
+──────────────────       ─────────────────      ──────────────
+                         Vcc ← +5В
+                         GND ← GND
+
+Pin 2 (STEP_Z) ────────► A (вход TX)
+                              Y ─────────────► пин 10  PP  (STEP+)
+                              Z ─────────────► пин 11  PG  (STEP−)
+
+Pin 3 (DIR_Z)  ────────► A (вход TX)         [второй MAX490]
+                              Y ─────────────► пин 35  NP  (DIR+)
+                              Z ─────────────► пин 36  NG  (DIR−)
+
+Примечание: Teensy работает на 3.3В. Входная логика MAX490 — совместима с 3.3В.
+Выходная линия MAX490 — RS-422 (5В дифференциальный). ТОЛЬКО ТАК.</code></pre>
+
+      <h3>Назначение пинов Teensy 4.1 — обе оси</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Teensy пин</th><th>Функция</th><th>Подключение</th></tr>
+        <tr class="key-row"><td>Pin 2</td><td>STEP_Z</td><td>MAX490 → CN1 пин 10 (PP) — драйвер #1 (ось Z)</td></tr>
+        <tr class="key-row"><td>Pin 3</td><td>DIR_Z</td><td>MAX490 → CN1 пин 35 (NP) — драйвер #1 (ось Z)</td></tr>
+        <tr class="key-row"><td>Pin 4</td><td>STEP_C</td><td>MAX490 → CN1 пин 10 (PP) — драйвер #2 (ось C)</td></tr>
+        <tr class="key-row"><td>Pin 5</td><td>DIR_C</td><td>MAX490 → CN1 пин 35 (NP) — драйвер #2 (ось C)</td></tr>
+        <tr><td>Pin 6</td><td>ЗАПАС</td><td>SON Z теперь через ПЛК DO7 → синий провод CN1 пин 15</td></tr>
+        <tr><td>Pin 7</td><td>ЗАПАС</td><td>SON C теперь через ПЛК DO8 → синий провод CN1 пин 15</td></tr>
+        <tr><td>Pin 8</td><td>ЗАПАС</td><td>Home Z — при необходимости</td></tr>
+        <tr><td>Pin 9</td><td>ЗАПАС</td><td>Home C — при необходимости</td></tr>
+        <tr><td>Pin 10</td><td>LIMIT_Z+</td><td>Концевик прямого хода оси Z</td></tr>
+        <tr><td>Pin 11</td><td>LIMIT_Z−</td><td>Концевик обратного хода оси Z</td></tr>
+      </table>
+      </div>
+
+      <h3>4.1 Таблица распайки самодельного кабеля управления CN1 (LAN)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Цвет жилы (LAN)</th><th>Пара</th><th>Пин CN1</th><th>Сигнал</th><th>Функция</th><th>Куда идет на плате</th></tr>
+        <tr><td><strong>Оранжевый</strong></td><td>1</td><td><strong>10</strong></td><td>PP</td><td>Step + (Импульс +)</td><td>MAX490 №1 (выход Y)</td></tr>
+        <tr><td><strong>Бело-Оранжевый</strong></td><td>1</td><td><strong>11</strong></td><td>PG</td><td>Step - (Импульс -)</td><td>MAX490 №1 (выход Z)</td></tr>
+        <tr><td><strong>Зеленый</strong></td><td>2</td><td><strong>35</strong></td><td>NP</td><td>Dir + (Направление +)</td><td>MAX490 №2 (выход Y)</td></tr>
+        <tr><td><strong>Бело-Зеленый</strong></td><td>2</td><td><strong>36</strong></td><td>NG</td><td>Dir - (Направление -)</td><td>MAX490 №2 (выход Z)</td></tr>
+        <tr><td><strong>Синий</strong></td><td>3</td><td><strong>15</strong></td><td>SON</td><td>Servo-ON (Включение)</td><td>На ПЛК DO7 (Z) / DO8 (C) — 24В</td></tr>
+        <tr><td><strong>Бело-Синий</strong></td><td>3</td><td><strong>48</strong></td><td>ALM</td><td>Alarm (Ошибка)</td><td>На вход ПЛК / Тинси</td></tr>
+        <tr><td><strong>Коричневый</strong></td><td>4</td><td><strong>20</strong></td><td>DICOM</td><td>Плюс питания входов</td><td><strong>+24В</strong> (от БП 60Вт)</td></tr>
+        <tr><td><strong>Бело-Коричневый</strong></td><td>4</td><td><strong>46</strong></td><td>DOCOM</td><td>Общий минус выходов</td><td><strong>0В (GND)</strong> (от БП 60Вт)</td></tr>
+        <tr><td><strong>ЭКРАН (фольга)</strong></td><td>—</td><td>Корпус</td><td>Shield</td><td>Заземление</td><td>Металлический кожух CN1</td></tr>
+      </table>
+      </div>
+
+      <details style="margin: 1.5rem 0; padding: 1rem; border: 1px solid var(--border-color); border-radius: 6px; background-color: var(--secondary-bg);">
+        <summary style="font-weight: bold; cursor: pointer; font-size: 1.1em; color: var(--accent-color);">Показать схемы распиновки сервоприводов (CN1, CN2, Энкодер)</summary>
+        <div style="margin-top: 1rem; display: flex; flex-direction: column; gap: 1rem;">
+          <div>
+            <h4>Распиновка CN1</h4>
+            <img src="../Сервоприводы/MR-JE_cn1_pinout.png" alt="CN1 Pinout" style="max-width: 100%; border: 1px solid #ccc; border-radius: 4px;">
+          </div>
+          <div>
+            <h4>Разъемы CN1 и CN2 (Общий вид MR-JE)</h4>
+            <img src="../Сервоприводы/MR-JE_cn1-cn2.png" alt="CN1 and CN2" style="max-width: 100%; border: 1px solid #ccc; border-radius: 4px;">
+          </div>
+          <div>
+            <h4>Круглый разъем мотора (HG-SN)</h4>
+            <img src="../Сервоприводы/HG-SN_pw_enc_pinout.png" alt="Motor Pinout" style="max-width: 100%; border: 1px solid #ccc; border-radius: 4px;">
+          </div>
+        </div>
+      </details>
+
+      <h3>4.2 Подключение MAX490 и Teensy (со стороны шкафа)</h3>
+      <p>Поскольку у нас <strong>2 сервопривода</strong> (Ось Z и Ось C), используются <strong>два отдельных LAN-кабеля</strong> (по одному от каждого CN1) и <strong>2 пары MAX490</strong> (всего 4 платки).</p>
+      
+      <h4>LAN-кабель 1: Ось Z (Серводрайвер #1)</h4>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Модуль</th><th>Клеммы MAX490 / Управление</th><th>Куда подключается к Teensy и LAN</th></tr>
+        <tr class="key-row"><td rowspan="4"><strong>Пара 1: MAX490 (Шаг Z)</strong></td><td><strong>DI</strong> (Вход)</td><td>Пин Teensy — <strong>Pin 2 (Step_Z)</strong></td></tr>
+        <tr class="key-row"><td><strong>Y</strong> (TX+ выход)</td><td><strong>Оранжевый</strong> провод LAN #1 → (пин 10 CN1)</td></tr>
+        <tr class="key-row"><td><strong>Z</strong> (TX- выход)</td><td><strong>Бело-оранжевый</strong> провод LAN #1 → (пин 11 CN1)</td></tr>
+        <tr class="key-row"><td><strong>VCC / GND</strong></td><td>Питание 3.3V и GND от БП / Teensy</td></tr>
+        
+        <tr><td rowspan="4"><strong>Пара 1: MAX490 (Напр. Z)</strong></td><td><strong>DI</strong> (Вход)</td><td>Пин Teensy — <strong>Pin 3 (Dir_Z)</strong></td></tr>
+        <tr><td><strong>Y</strong> (TX+ выход)</td><td><strong>Зеленый</strong> провод LAN #1 → (пин 35 CN1)</td></tr>
+        <tr><td><strong>Z</strong> (TX- выход)</td><td><strong>Бело-зеленый</strong> провод LAN #1 → (пин 36 CN1)</td></tr>
+        <tr><td><strong>VCC / GND</strong></td><td>Питание 3.3V и GND от БП / Teensy</td></tr>
+
+        <tr class="key-row"><td><strong>SON (Ось Z)</strong></td><td><strong>Синий провод</strong></td><td>ПЛК <strong>DO7</strong> (+24В релейный выход) → CN1 пин 15 (SON)</td></tr>
+      </table>
+      </div>
+
+      <h4>LAN-кабель 2: Ось C (Серводрайвер #2)</h4>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Модуль</th><th>Клеммы MAX490 / Управление</th><th>Куда подключается к Teensy и LAN</th></tr>
+        <tr class="key-row"><td rowspan="4"><strong>Пара 2: MAX490 (Шаг C)</strong></td><td><strong>DI</strong> (Вход)</td><td>Пин Teensy — <strong>Pin 4 (Step_C)</strong></td></tr>
+        <tr class="key-row"><td><strong>Y</strong> (TX+ выход)</td><td><strong>Оранжевый</strong> провод LAN #2 → (пин 10 CN1)</td></tr>
+        <tr class="key-row"><td><strong>Z</strong> (TX- выход)</td><td><strong>Бело-оранжевый</strong> провод LAN #2 → (пин 11 CN1)</td></tr>
+        <tr class="key-row"><td><strong>VCC / GND</strong></td><td>Питание 3.3V и GND от БП / Teensy</td></tr>
+        
+        <tr><td rowspan="4"><strong>Пара 2: MAX490 (Напр. C)</strong></td><td><strong>DI</strong> (Вход)</td><td>Пин Teensy — <strong>Pin 5 (Dir_C)</strong></td></tr>
+        <tr><td><strong>Y</strong> (TX+ выход)</td><td><strong>Зеленый</strong> провод LAN #2 → (пин 35 CN1)</td></tr>
+        <tr><td><strong>Z</strong> (TX- выход)</td><td><strong>Бело-зеленый</strong> провод LAN #2 → (пин 36 CN1)</td></tr>
+        <tr><td><strong>VCC / GND</strong></td><td>Питание 3.3V и GND от БП / Teensy</td></tr>
+
+        <tr class="key-row"><td><strong>SON (Ось C)</strong></td><td><strong>Синий провод</strong></td><td>ПЛК <strong>DO8</strong> (+24В релейный выход) → CN1 пин 15 (SON)</td></tr>
+      </table>
+      </div>
+
+      <h4>Общие жилы (питание и ошибки) — для ОБОИХ кабелей:</h4>
+      <ul>
+        <li><strong>Коричневый провод</strong> — к БП <strong>+24В</strong> (вход DICOM пин 20).</li>
+        <li><strong>Бело-коричневый провод</strong> — к БП <strong>0В / GND</strong> (выход DOCOM пин 46 и земля реле).</li>
+        <li><strong>Бело-синий провод</strong> — к входам Teensy / ПЛК (ALM) подтяжка 4.7кОм к 24В.</li>
+        <li><strong>ЭКРАН</strong> — обязательно на корпус шкафа (PE) со стороны шкафа (не у мотора).</li>
+      </ul>
+
+      <h2>5. Параметры серводрайвера (Pr.)</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th><th>Описание</th></tr>
+        <tr class="key-row">
+          <td class="mono bold">Pr.PA01</td><td class="bold">0000</td>
+          <td><strong>Режим управления: Position (Step/Dir, CP mode)</strong></td>
+        </tr>
+        <tr class="key-row">
+          <td class="mono bold">Pr.PD01</td><td class="bold">1000</td>
+          <td><strong>Конфигурация входного фильтра — УСТРАНЯЕТ AL.E6.1!</strong></td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PA06</td><td>1</td>
+          <td>Электронный редуктор: числитель. PA06/PA07=1/1 → 262144 имп/оборот</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PA07</td><td>1</td>
+          <td>Электронный редуктор: знаменатель</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PD03</td><td>(умолч.)</td>
+          <td>Назначение SON на пин 15 (по умолчанию)</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PD12</td><td>(умолч.)</td>
+          <td>DI0 (пин 19) = EMG — аварийный стоп (по умолчанию)</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PD18</td><td>(умолч.)</td>
+          <td>LSP на пин 43 (по умолчанию)</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PD20</td><td>(умолч.)</td>
+          <td>LSN на пин 44 (по умолчанию)</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PD24</td><td>1</td>
+          <td>Режим сигнала SON: 1 = по уровню (держать +24В = серво ON)</td>
+        </tr>
+        <tr>
+          <td class="mono">Pr.PA14</td><td>10</td>
+          <td>ID привода (для идентификации, необязательно)</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>Электронный редуктор (PA06 / PA07)</h3>
+      <pre><code>Вариант A — максимальная точность:
+  PA06=1,     PA07=1      → 262 144 имп. на оборот (используется разрешение 18 бит)
+
+Вариант B — удобные числа для Teensy:
+  PA06=10000, PA07=262144 → 10 000 имп. на оборот (проще считать позицию)</code></pre>
+
+      <h2>6. Подключение CN2 (энкодер двигателя)</h2>
+      <pre><code>Мотор HG-SN [разъём круглый CMV1-R10P]   Усилитель MR-JE-200A [CN2]
+──────────────────────────────────────     ──────────────────────────
+Пин 8  P5 (+5В)  ────────────────────────► CN2 пин 1  P5
+Пин 5  LG (GND)  ────────────────────────► CN2 пин 2  LG
+Пин 1  MR (Data+) ───────────────────────► CN2 пин 3  MR   (витая пара!)
+Пин 2  MRR (Data−) ──────────────────────► CN2 пин 4  MRR  (витая пара!)
+Корпус + пин 10 SHD ─────────────────────► Корпус CN2 (экран)
+
+Кабель: экранированный. MR/MRR — в одной витой паре.
+Питание (+5В): несколько проводов в параллели (снизить падение напряжения).</code></pre>
+
+      <h2>7. Минимальное подключение CN1 для тестового JOG-режима</h2>
+
+      <p>До подключения Teensy — проверить серво в JOG-режиме через MR Configurator2 (ПК → USB-B → драйвер). Достаточно подключить только:</p>
+      <pre><code>+25В ────────► SON   (пин 15)   Servo ON
++25В ────────► DI0   (пин 19)   EMG разрешён (или перемычка +25В)
++25В ────────► LSP   (пин 43)   Концевик + (или перемычка +25В)
++25В ────────► LSN   (пин 44)   Концевик − (или перемычка +25В)
+GND  ────────► DICOM (пин 20)   Общий входов (Source mode)
+
+Пины 10, 11, 35, 36 (Step/Dir) — НЕ ПОДКЛЮЧАТЬ.
+
+Результат: дисплей показывает d01 → d09 (серво ON, готов к работе).</code></pre>
+
+      <h2>8. Устранение аварии AL.E6.1</h2>
+
+      <div class="alert alert-warn">
+        <strong>AL.E6.1 — серво выключается при движении / некорректный порядок сигналов</strong>
+      </div>
+
+      <div class="steps">
+        <ol>
+          <li>Убрать все сигналы Step/Dir с пинов 10, 11, 35, 36 (отключить временно).</li>
+          <li>Убедиться в правильном подключении: DICOM (20/21) = 0В, DI0 (19) = +24В, LSP (43) = +24В, LSN (44) = +24В, SON (15) = +24В.</li>
+          <li>Установить параметр <strong>Pr.PD01 = 1000</strong> через панель или MR Configurator2.</li>
+          <li>Сбросить аварию: кнопка SET/RESET на панели или через MR Configurator2.</li>
+          <li>Дождаться <code>d09</code> на дисплее (серво готово).</li>
+          <li>Только после <code>d09</code> — подавать Step/Dir сигналы.</li>
+        </ol>
+      </div>
+
+      <h2>9. Таблица кодов аварий MR-JE-200A</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Код</th><th>Описание</th><th>Решение</th></tr>
+        <tr><td class="mono">AL.10</td><td>Пониженное напряжение питания</td><td>Проверить L1/L2, автомат 16А</td></tr>
+        <tr><td class="mono">AL.16</td><td>Ошибка энкодера CN2</td><td>Проверить кабель CN2, распиновку, витую пару MR/MRR</td></tr>
+        <tr><td class="mono">AL.19</td><td>Перегрузка по току</td><td>Проверить U/V/W, снизить нагрузку, ускорение</td></tr>
+        <tr><td class="mono">AL.32</td><td>Превышение ошибки позиции</td><td>Снизить ускорение, увеличить усиление</td></tr>
+        <tr><td class="mono">AL.37</td><td>Ошибка EMG (нет сигнала)</td><td>Подключить DI0 (пин 19) к +24В через НЗ цепь</td></tr>
+        <tr class="key-row">
+          <td class="mono bold">AL.E6 / AL.E6.1</td>
+          <td><strong>Серво выкл. при движении / некорр. порядок</strong></td>
+          <td><strong>Pr.PD01=1000, подать SON до Step/Dir, см. п.8</strong></td>
+        </tr>
+      </table>
+      </div>
+
+      <footer>Трубогиб ЧПУ — Мануал v2.1 | Март 2026</footer>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,149 @@
+(* Backup of test.exp — full project POU content saved as trubogib1.exp *)
+
+(* This file is a snapshot copy of `test.exp` from the workspace root taken
+   as a restore point before modifying `test2.exp`. *)
+
+(* Original content of test.exp follows. *)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+PROGRAM PLC_PRG
+VAR
+    enableStart : BOOL; (* D5 - Enable *)
+    btnD7 : BOOL;       (* D7 - Button *)
+    btnD8 : BOOL;       (* D8 - Reverse Button *)
+    enableEdge : R_TRIG; (* rising edge detector for enable *)
+    startEdge : R_TRIG; (* rising edge detector for start button *)
+    startEdgeD8 : R_TRIG; (* rising edge detector for reverse button *)
+    encAEdge : R_TRIG;  (* encoder A rising edge detector *)
+    encBEdge : R_TRIG;  (* encoder B rising edge detector *)
+    resetBtn : BOOL;    (* reset button local read *)
+    resetEdgeBtn : R_TRIG; (* rising edge detector for reset button *)
+
+    (* Beeper timers/FBs for 3 short beeps over 2s *)
+    gBeepStart : BOOL; (* start beeper sequence flag, local control *)
+    tBeepTotal : TON;  (* total beeper duration *)
+    tBeepDelay1 : TON; (* beep 1 delay (0ms) *)
+    tBeepDelay2 : TON; (* beep 2 delay (600ms) *)
+    tBeepDelay3 : TON; (* beep 3 delay (1200ms) *)
+    rTrigBeep1 : R_TRIG;
+    rTrigBeep2 : R_TRIG;
+    rTrigBeep3 : R_TRIG;
+    tpBeep : TP;       (* pulse timer to generate short beep *)
+    tpTrigger : BOOL;  (* internal trigger for TP *)
+    (* Error beeper: 6 short pulses (150ms) *)
+    errorBeepStart : BOOL;
+    tErrTotal : TON;
+    tErrDelay1 : TON;
+    tErrDelay2 : TON;
+    tErrDelay3 : TON;
+    tErrDelay4 : TON;
+    tErrDelay5 : TON;
+    tErrDelay6 : TON;
+    rTrigErr1 : R_TRIG;
+    rTrigErr2 : R_TRIG;
+    rTrigErr3 : R_TRIG;
+    rTrigErr4 : R_TRIG;
+    rTrigErr5 : R_TRIG;
+    rTrigErr6 : R_TRIG;
+    tpErr : TP;
+    arrivedTargetSignalled : BOOL;
+    arrivedHomeSignalled : BOOL;
+    (* Start-timeout / alarm logic *)
+    startTimeoutActive : BOOL;
+    tStartTimeout : TON;    (* 2s timer to detect no movement after pedal press *)
+    errorLock : BOOL;       (* when TRUE, outputs disabled until reset *)
+    (* desiredMove: 1 = forward, -1 = reverse, 0 = none *)
+    desiredMove : INT;
+    encDelta : INT;         (* +1/-1 from encoder edge direction *)
+    (* DO9 alarm pulse and enable (D5) long beep *)
+    do9PulseTrigger : BOOL;
+    tpDO9 : TP;
+    tpEnable : TP;
+    blockedPedal : INT;    (* 0=none, 7=forward pedal blocked, 8=reverse pedal blocked *)
+    prevEnableStart : BOOL; (* previous scan state of D5 for falling-edge detection *)
+    manualModeLocal : BOOL;
+    (* local cycle debug / runtime indicator handled in globals too *)
+END_VAR
+
+(* @END_DECLARATION := '0' *)
+(* Read inputs *)
+enableStart := gDI_5; (* D5 used as manual mode switch *)
+(* manualMode TRUE = D5 pressed = manual mode (free rotation). FALSE = normal mode with limits *)
+manualModeLocal := enableStart;
+btnD7 := gDI_7;
+btnD8 := gDI_8;
+
+(* Detect falling edge of D5 (manual -> normal): when prevEnableStart was TRUE and now FALSE *)
+IF (prevEnableStart AND NOT enableStart) THEN
+    (* manual turned OFF -> reset angle and start normal cycle 1 immediately *)
+    gCurrentAngle := 0.0;
+    gEncoderCount := 0;
+    gCycle := 1;
+    gTargetAngle := gDefaultTarget;
+    gDO_10 := FALSE;
+    gDO_11 := FALSE;
+    gDO_12 := FALSE;
+    gStatus := 0;
+END_IF;
+
+(* Edge detectors *)
+enableEdge(CLK := enableStart);
+startEdge(CLK := btnD7);
+startEdgeD8(CLK := btnD8);
+encAEdge(CLK := gEncoderA);
+encBEdge(CLK := gEncoderB);
+
+(* Set `gTargetAngle` according to `gCycle` rule:
+   - gCycle = 1 -> use `gDefaultTarget` (e.g., 45°)
+   - gCycle = 2 -> use 0.0 (home)
+   - otherwise -> use `gDefaultTarget`
+   This enforces the user's rule deterministically each scan. *)
+IF NOT manualModeLocal THEN
+    IF gCycle = 1 THEN
+        gTargetAngle := gDefaultTarget;
+    ELSIF gCycle = 2 THEN
+        gTargetAngle := 0.0;
+    ELSE
+        gTargetAngle := gDefaultTarget;
+    END_IF;
+END_IF;
+
+(* On system enable rising edge: clear latched alarms and reset outputs (do not reset encoder/angle) *)
+(* On enable rising edge: manual mode entered. Do not reset encoder/angle here.
+    Reset on manual->normal transition (falling edge) is handled separately. *)
+
+(* Encoder counting (count on rising edge of A; direction by B); adjust direction later if inverted *)
+IF encAEdge.Q THEN
+    IF gEncoderB THEN
+        encDelta := 1;
+        gEncoderCount := gEncoderCount + 1;
+    ELSE
+        encDelta := -1;
+        gEncoderCount := gEncoderCount - 1;
+    END_IF;
+    (* Cancel start-timeout only if motion is toward desiredMove *)
+    IF (startTimeoutActive) AND (desiredMove <> 0) THEN
+        IF (encDelta = desiredMove) THEN
+            startTimeoutActive := FALSE;
+            desiredMove := 0; (* movement detected toward target - disarm *)
+        END_IF;
+    END_IF;
+END_IF;
+
+(* Ensure counts-per-rev is valid and compute current angle from encoder count *)
+IF (gCalibCountsPerRev = 0) THEN
+    gCalibCountsPerRev := 360; (* default PPR *)
+END_IF;
+
+(* Calculate current angle from encoder count. Inverted sign to change rotation direction *)
+gCurrentAngle := - DINT_TO_REAL(gEncoderCount) * 360.0 / DINT_TO_REAL(gCalibCountsPerRev);
+
+(* ... rest of original `test.exp` content ... *)
+(* Backup: original test.exp saved as trubogib1.exp *)
+(* This file is a copy of test.exp from workspace root. Use as restore point. *)
+
+(* Original content follows... *)
+

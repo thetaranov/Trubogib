@@ -1,0 +1,9 @@
+LIBRARY
+ANALYZATION.LIB 5.10.99 09:05:06
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 2
+AnalyzeExpression: 0
+AppendErrorString: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY

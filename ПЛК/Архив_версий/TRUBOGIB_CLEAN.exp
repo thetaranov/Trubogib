@@ -1,0 +1,1178 @@
+
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+PROGRAM PLC_PRG
+VAR
+    (* First scan flag *)
+    init_done : BOOL := FALSE;
+
+    (* Control Inputs *)
+    prev_d5 : BOOL;
+    enableStart : BOOL;      (* D5: 1=Manual, 0=Auto *)
+    btnD7 : BOOL;            (* D7: Pedal Forward *)
+    btnD8 : BOOL;            (* D8: Pedal Backward *)
+    both : BOOL;             (* Both pedals *)
+    
+    (* Encoder *)
+    encAEdge : R_TRIG;
+    encBEdge : R_TRIG;
+    
+    (* Process State *)
+    done : BOOL := FALSE;    (* Target reached flag *)
+    
+    (* Timers & Triggers *)
+    targetPulseTrigger : BOOL := FALSE;
+    tpTarget : TP;           (* Pulse on DO12 *)
+    beepTargetTrigger : BOOL := FALSE;
+    tpBeepTarget : TP;       (* Beep on target reached *)
+    
+    errorBeepTrigger : BOOL := FALSE;
+    tErrTotal : TON;
+    tErrDelay1 : TON;
+    tErrDelay2 : TON;
+    tErrDelay3 : TON;
+    rTrigErr1 : R_TRIG;
+    rTrigErr2 : R_TRIG;
+    rTrigErr3 : R_TRIG;
+    tpErr : TP;
+
+    (* Done auto-reset timer: holds done=TRUE for 500ms then resets *)
+    tonDoneHold : TON;
+    doneHolding : BOOL := FALSE;
+
+    (* Change beep - 2 short beeps for: default angle change, mode switch *)
+    changeBeepTrigger : BOOL := FALSE;
+    tChangeTotal : TON;
+    tChangeDelay1 : TON;
+    tChangeDelay2 : TON;
+    rTrigChange1 : R_TRIG;
+    rTrigChange2 : R_TRIG;
+    tpChangeBeep : TP;
+
+    (* Edge detection for error beeps *)
+    prev_d7 : BOOL := FALSE;
+    prev_d8 : BOOL := FALSE;
+    prev_both : BOOL := FALSE;
+
+    (* Modbus command edge detection *)
+    prev_mb_in_command : WORD := 0;
+    prev_mb_in_WebTarget : WORD := 0;
+END_VAR
+(* @END_DECLARATION := '0' *)
+(* 1. Input Mapping *)
+enableStart := gDI_5; 
+btnD7 := gDI_7;       
+btnD8 := gDI_8;       
+both := btnD7 AND btnD8;
+
+(* 1.1 First scan init - prevent false edge detection *)
+IF NOT init_done THEN
+    prev_d5 := enableStart;
+    prev_mb_in_WebTarget := mb_in_WebTarget;
+    prev_mb_in_command := mb_in_Command;
+    init_done := TRUE;
+END_IF;
+
+(* 2. Encoder Processing *)
+encAEdge(CLK := gEncoderA);
+encBEdge(CLK := gEncoderB);
+
+IF encAEdge.Q THEN
+    IF gEncoderB THEN
+        gEncoderCount := gEncoderCount + 1;
+    ELSE
+        gEncoderCount := gEncoderCount - 1;
+    END_IF;
+END_IF;
+
+(* 3. Angle Calculation - 360P/R encoder: 1 count = 1 degree *)
+IF gCalibCountsPerRev = 0 THEN
+    gCalibCountsPerRev := 360;
+END_IF;
+gCurrentAngle := DINT_TO_INT(- gEncoderCount * 360 / gCalibCountsPerRev);
+
+(* 4. Mode Switching - beep only, zero reset moved to web button *)
+IF prev_d5 <> enableStart THEN
+    changeBeepTrigger := TRUE;
+    IF prev_d5 AND NOT enableStart THEN
+        (* Manual->Auto: just prepare for auto mode, no zero reset *)
+        gCycle := 1;
+        gTargetAngle := gDefaultTarget;
+        done := FALSE;
+    END_IF;
+END_IF;
+prev_d5 := enableStart;
+
+(* 5. Modbus / Web Commands Processing *)
+
+(* 5.1 Web Target Update - register 10 - edge detection *)
+(* ESP holds value for 500ms, then clears to 0 *)
+(* PLC detects non-zero value different from prev *)
+IF mb_in_WebTarget <> 0 AND mb_in_WebTarget <> prev_mb_in_WebTarget THEN
+    gDefaultTarget := WORD_TO_INT(mb_in_WebTarget);
+    gTargetAngle := gDefaultTarget;
+    done := FALSE;
+    gCycle := 1;
+    changeBeepTrigger := TRUE;
+END_IF;
+prev_mb_in_WebTarget := mb_in_WebTarget;
+
+(* 5.2 Command Register - register 9 *)
+IF mb_in_Command <> 0 AND mb_in_Command <> prev_mb_in_command THEN
+    CASE WORD_TO_INT(mb_in_Command) OF
+        1: (* START *)
+            IF NOT enableStart THEN done := FALSE; gCycle := 1; gTargetAngle := gDefaultTarget; END_IF;
+        2: (* STOP *)
+            done := TRUE;
+        3: (* ZERO - full reset: zero encoder, set cycle 1, reset done *)
+            gEncoderCount := 0;
+            gCurrentAngle := 0;
+            gCycle := 1;
+            gTargetAngle := gDefaultTarget;
+            done := FALSE;
+            changeBeepTrigger := TRUE;
+    END_CASE;
+END_IF;
+prev_mb_in_command := mb_in_Command;
+
+(* 6. Cycle Logic (Auto Mode) *)
+IF NOT enableStart AND NOT done THEN
+    IF gCycle = 1 THEN
+        gTargetAngle := gDefaultTarget;
+    ELSIF gCycle = 2 THEN
+        gTargetAngle := 0;
+    END_IF;
+END_IF;
+
+(* 7. Output to Modbus (PLC -> ESP registers 0-6) *)
+mb_out_DefaultTarget := INT_TO_WORD(gDefaultTarget);
+mb_out_CurrentAngle  := INT_TO_WORD(ABS(gCurrentAngle));
+mb_out_TargetAngle   := INT_TO_WORD(gTargetAngle);
+mb_out_Cycle         := INT_TO_WORD(gCycle);
+
+IF done THEN mb_out_Done := 1; ELSE mb_out_Done := 0; END_IF;
+IF enableStart THEN mb_out_Mode := 1; ELSE mb_out_Mode := 0; END_IF;
+
+mb_out_Pedals := 0;
+IF btnD7 THEN mb_out_Pedals := mb_out_Pedals + 1; END_IF;
+IF btnD8 THEN mb_out_Pedals := mb_out_Pedals + 2; END_IF;
+
+(* 8. Motor Control Logic *)
+IF enableStart THEN  (* MANUAL MODE *)
+    gDO_10 := btnD7 AND NOT btnD8 AND NOT both;
+    gDO_11 := btnD8 AND NOT btnD7 AND NOT both;
+ELSE  (* AUTO MODE *)
+    (* Cycle 1: bending - only forward allowed, backward jams tube *)
+    (* Cycle 2: return  - only backward allowed, forward jams tube *)
+    gDO_10 := btnD7 AND NOT btnD8 AND (gCurrentAngle < gTargetAngle) AND NOT done AND (gCycle = 1);
+    gDO_11 := btnD8 AND NOT btnD7 AND (gCurrentAngle > 0) AND NOT done AND (gCycle = 2);
+END_IF;
+
+(* 9. Target Reached Check - directional, can't be missed by fast encoder *)
+IF NOT enableStart AND NOT done THEN
+    IF (gCycle = 1 AND gCurrentAngle >= gTargetAngle AND gTargetAngle > 0) THEN
+        (* Cycle 1: forward bending reached or passed target *)
+        done := TRUE;
+        doneHolding := TRUE;
+        targetPulseTrigger := TRUE;
+        beepTargetTrigger := TRUE;
+        gCycle := 2;
+        gTargetAngle := 0;        (* Next target: return to zero *)
+    ELSIF (gCycle = 2 AND gCurrentAngle <= gTargetAngle) THEN
+        (* Cycle 2: backward return reached or passed zero *)
+        done := TRUE;
+        doneHolding := TRUE;
+        targetPulseTrigger := TRUE;
+        beepTargetTrigger := TRUE;
+        gCycle := 1;
+        gTargetAngle := gDefaultTarget; (* Next target: bend again *)
+    END_IF;
+END_IF;
+
+(* 9.1 Done Auto-Reset: hold done=TRUE for 500ms pause, then allow next cycle *)
+(* This gives operator time to release pedal and hear beep before next action *)
+tonDoneHold(IN := doneHolding, PT := T#500MS);
+IF tonDoneHold.Q THEN
+    done := FALSE;
+    doneHolding := FALSE;
+END_IF;
+
+(* 10. Indication & Beeper *)
+
+(* Target Reached Pulse *)
+tpTarget(IN := targetPulseTrigger, PT := T#500MS);
+IF tpTarget.Q THEN targetPulseTrigger := FALSE; END_IF;
+
+(* Success Beep - target reached (1 x 500ms) *)
+(* Success Beep - target reached (1 x 200ms) *)
+tpBeepTarget(IN := beepTargetTrigger, PT := T#200MS);
+
+(* Error Conditions - auto mode, any cycle *)
+IF NOT enableStart THEN
+    (* Both pedals pressed *)
+    IF both AND NOT prev_both THEN
+        errorBeepTrigger := TRUE;
+    END_IF;
+    (* Forward pedal beyond limit or wrong cycle *)
+    IF btnD7 AND NOT prev_d7 THEN
+        IF gCurrentAngle >= gDefaultTarget OR gCycle = 2 THEN
+            errorBeepTrigger := TRUE;
+        END_IF;
+    END_IF;
+    (* Backward pedal at zero or wrong cycle *)
+    IF btnD8 AND NOT prev_d8 THEN
+        IF gCurrentAngle <= 0 OR gCycle = 1 THEN
+            errorBeepTrigger := TRUE;
+        END_IF;
+    END_IF;
+END_IF;
+
+(* Error Beep Sequence (3 short beeps x 200ms) *)
+tErrTotal(IN := errorBeepTrigger, PT := T#1400MS);
+tErrDelay1(IN := errorBeepTrigger, PT := T#0MS);
+tErrDelay2(IN := errorBeepTrigger, PT := T#400MS);
+tErrDelay3(IN := errorBeepTrigger, PT := T#800MS);
+
+rTrigErr1(CLK := tErrDelay1.Q);
+rTrigErr2(CLK := tErrDelay2.Q);
+rTrigErr3(CLK := tErrDelay3.Q);
+
+tpErr(IN := (rTrigErr1.Q OR rTrigErr2.Q OR rTrigErr3.Q), PT := T#200MS);
+
+(* Change Beep - default angle change / mode switch (2 x 150ms) *)
+tChangeTotal(IN := changeBeepTrigger, PT := T#800MS);
+tChangeDelay1(IN := changeBeepTrigger, PT := T#0MS);
+tChangeDelay2(IN := changeBeepTrigger, PT := T#400MS);
+
+rTrigChange1(CLK := tChangeDelay1.Q);
+rTrigChange2(CLK := tChangeDelay2.Q);
+
+tpChangeBeep(IN := (rTrigChange1.Q OR rTrigChange2.Q), PT := T#150MS);
+
+(* Combined beeper output - ALL signals *)
+gBeeper := tpBeepTarget.Q OR tpErr.Q OR tpChangeBeep.Q;
+
+(* DO12 mirrors ALL beeper signals (external loud speaker) *)
+gDO_12 := gBeeper;
+
+IF tErrTotal.Q THEN errorBeepTrigger := FALSE; END_IF;
+IF tChangeTotal.Q THEN changeBeepTrigger := FALSE; END_IF;
+IF NOT tpBeepTarget.Q THEN beepTargetTrigger := FALSE; END_IF;
+
+(* Update Previous States *)
+prev_d7 := btnD7;
+prev_d8 := btnD8;
+prev_both := both;
+END_PROGRAM
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+TYPE COMSETTINGS_FALLBACK : STRUCT
+    Port : INT; (* PORTS in library; INT used locally to avoid enum conflicts *)
+    dwBaudRate : DWORD;
+    byStopBits : BYTE;
+    byParity : BYTE;
+    dwTimeout : DWORD;
+    dwBufferSize : DWORD;
+    dwScan : DWORD;
+END_STRUCT
+END_TYPE
+
+(* @END_DECLARATION := '0' *)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Global_Variables' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+
+VAR_GLOBAL RETAIN
+    (* Inputs *)
+    gDI_1   AT %IX0.0   : BOOL; (* Fast Input 1 *)
+    gDI_2   AT %IX0.1   : BOOL; (* Fast Input 2 *)
+    gDI_3   AT %IX1.0.0 : BOOL; (* Input 3 *)
+    gDI_4   AT %IX1.0.1 : BOOL; (* Input 4 *)
+    gDI_5   AT %IX1.0.2 : BOOL; (* Input 5 - Mode switch *)
+    gDI_6   AT %IX1.0.3 : BOOL; (* Input 6 *)
+    gDI_7   AT %IX1.0.4 : BOOL; (* Input 7 - Pedal Forward *)
+    gDI_8   AT %IX1.0.5 : BOOL; (* Input 8 - Pedal Backward *)
+    gDI_9   AT %IX1.0.6 : BOOL; (* Input 9 *)
+    gDI_10  AT %IX1.0.7 : BOOL; (* Input 10 *)
+    gDI_11  AT %IX1.1.0 : BOOL; (* Input 11 *)
+    gDI_12  AT %IX1.1.1 : BOOL; (* Input 12 *)
+    gDI_13  AT %IX1.1.2 : BOOL; (* Input 13 *)
+    gDI_14  AT %IX1.1.3 : BOOL; (* Input 14 *)
+    gDI_15  AT %IX1.1.4 : BOOL; (* Input 15 *)
+    gDI_16  AT %IX1.1.5 : BOOL; (* Input 16 *)
+    gDI_17  AT %IX1.1.6 : BOOL; (* Input 17 *)
+    gDI_18  AT %IX1.1.7 : BOOL; (* Input 18 *)
+
+    (* Encoder inputs *)
+    gEncoderA AT %IX0.0 : BOOL;  (* Encoder A *)
+    gEncoderB AT %IX0.1 : BOOL;  (* Encoder B *)
+
+    (* Outputs *)
+    gDO_1   AT %QX2.0   : BOOL; (* Fast Output 1 *)
+    gDO_2   AT %QX2.1   : BOOL; (* Fast Output 2 *)
+    gDO_3   AT %QX2.2   : BOOL; (* Fast Output 3 *)
+    gDO_4   AT %QX2.3   : BOOL; (* Fast Output 4 *)
+    gDO_5   AT %QX3.0.0 : BOOL; (* Output 5 *)
+    gDO_6   AT %QX3.0.1 : BOOL; (* Output 6 *)
+    gDO_7   AT %QX3.0.2 : BOOL; (* Output 7 *)
+    gDO_8   AT %QX3.0.3 : BOOL; (* Output 8 *)
+    gDO_9   AT %QX3.0.4 : BOOL; (* Output 9 *)
+    gDO_10  AT %QX3.0.5 : BOOL; (* Output 10 - Motor Forward *)
+    gDO_11  AT %QX3.0.6 : BOOL; (* Output 11 - Motor Backward *)
+    gDO_12  AT %QX3.0.7 : BOOL; (* Output 12 - Target Pulse *)
+
+    (* Beeper *)
+    gBeeper AT %QX5.0   : BOOL; (* Beeper output *)
+
+    (* ModBus Master *)
+    gModbus_Master_Channel AT %QD6.0 : DWORD; (* Last address *)
+    gModbus_Master_LastError AT %QW6.1 : WORD; (* Last error *)
+
+    (* Internal state *)
+    gTargetAngle : INT := 45;
+    gDefaultTarget : INT := 45;
+    gCurrentAngle : INT := 0;
+    gCycle : INT := 1;
+    gEncoderCount : DINT := 0;
+    gCalibCountsPerRev : DINT := 360;
+END_VAR
+(* @OBJECT_END := 'Global_Variables' *)
+(* @CONNECTIONS := Global_Variables
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Variable_Configuration_1' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+VAR_CONFIG
+END_VAR
+(* @OBJECT_END := 'Variable_Configuration_1' *)
+(* @CONNECTIONS := Variable_Configuration_1
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)
+
+PLC_CONFIGURATION
+_GLOBAL
+_VERSION: 3
+_AUTOADR: 1
+_CHECKADR: 1
+_SAVECONFIGFILESINPROJECT: 0
+_END_GLOBAL
+
+_MODULE: '3S'
+_SECTION_NAME: 'Root'
+_INDEX_IN_PARENT: '-1'
+_MODULE_NAME: 'PLC110_30'
+_NODE_ID: -1
+_IECIN: %IB0
+_IECOUT: %QB0
+_IECDIAG: %MB0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'PLC110-30_v2'
+_PARAM 2: 0, '1'
+_PARAM 3: 0, '1000'
+_END_PARAMETER
+
+_MODULE: '3S'
+_SECTION_NAME: 'I_SIMPLE_INPUT'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Fast discrete inputs'
+_NODE_ID: 0
+_IECIN: %IB0
+_IECOUT: %QB0
+_IECDIAG: %MB0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Fast discrete inputs'
+_PARAM 2: 0, '10000'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Discrete input 1'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX0.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Discrete input 2'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX0.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID130'
+_INDEX_IN_PARENT: '2'
+_MODULE_NAME: 'Discrete inputs - 16'
+_NODE_ID: 1
+_IECIN: %IB1
+_IECOUT: %QB1
+_IECDIAG: %MB1
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Discrete inputs'
+_PARAM 2: 0, '10'
+_PARAM 3: 0, '16'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ByteInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 discrete inputs'
+_CHANNEL_MODE: 'I'
+_IECADR: %IB1.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %IX1.0.0 '' 'Bit 0'
+_BIT 1: %IX1.0.1 '' 'Bit 1'
+_BIT 2: %IX1.0.2 '' 'Bit 2'
+_BIT 3: %IX1.0.3 '' 'Bit 3'
+_BIT 4: %IX1.0.4 '' 'Bit 4'
+_BIT 5: %IX1.0.5 '' 'Bit 5'
+_BIT 6: %IX1.0.6 '' 'Bit 6'
+_BIT 7: %IX1.0.7 '' 'Bit 7'
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'ByteInput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 discrete inputs'
+_CHANNEL_MODE: 'I'
+_IECADR: %IB1.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %IX1.1.0 '' 'Bit 0'
+_BIT 1: %IX1.1.1 '' 'Bit 1'
+_BIT 2: %IX1.1.2 '' 'Bit 2'
+_BIT 3: %IX1.1.3 '' 'Bit 3'
+_BIT 4: %IX1.1.4 '' 'Bit 4'
+_BIT 5: %IX1.1.5 '' 'Bit 5'
+_BIT 6: %IX1.1.6 '' 'Bit 6'
+_BIT 7: %IX1.1.7 '' 'Bit 7'
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'OWEN_ID570'
+_INDEX_IN_PARENT: '3'
+_MODULE_NAME: 'Fast discrete outputs'
+_NODE_ID: 2
+_IECIN: %IB2
+_IECOUT: %QB2
+_IECDIAG: %MB2
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Fast discrete outputs'
+_PARAM 2: 0, 'FALSE'
+_PARAM 3: 0, 'FALSE'
+_PARAM 4: 0, 'FALSE'
+_PARAM 5: 0, 'FALSE'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 1'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 2'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '3'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 3'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.2
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '4'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 4'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.3
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID131'
+_INDEX_IN_PARENT: '4'
+_MODULE_NAME: 'Discrete outputs - 8'
+_NODE_ID: 3
+_IECIN: %IB3
+_IECOUT: %QB3
+_IECDIAG: %MB3
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Discrete outputs'
+_PARAM 2: 0, '0'
+_PARAM 3: 0, 'No'
+_PARAM 4: 0, '10'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ByteOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 discrete outputs'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QB3.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %QX3.0.0 '' 'Bit 0'
+_BIT 1: %QX3.0.1 '' 'Bit 1'
+_BIT 2: %QX3.0.2 '' 'Bit 2'
+_BIT 3: %QX3.0.3 '' 'Bit 3'
+_BIT 4: %QX3.0.4 '' 'Bit 4'
+_BIT 5: %QX3.0.5 '' 'Bit 5'
+_BIT 6: %QX3.0.6 '' 'Bit 6'
+_BIT 7: %QX3.0.7 '' 'Bit 7'
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID103'
+_INDEX_IN_PARENT: '5'
+_MODULE_NAME: 'Special input'
+_NODE_ID: 4
+_IECIN: %IB4
+_IECOUT: %QB4
+_IECDIAG: %MB4
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Special input'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Special input'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX4.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID104'
+_INDEX_IN_PARENT: '6'
+_MODULE_NAME: 'Special output'
+_NODE_ID: 5
+_IECIN: %IB5
+_IECOUT: %QB5
+_IECDIAG: %MB5
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Special output'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Special output'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX5.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'MODBUS_MASTER_ID450'
+_INDEX_IN_PARENT: '7'
+_MODULE_NAME: 'ModBus (Master)'
+_NODE_ID: 6
+_IECIN: %IB6
+_IECOUT: %QB6
+_IECDIAG: %MB6
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'ModBus (Master)'
+_PARAM 2: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'DWordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Last address'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QD6.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Last error'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_MODULE: '3S'
+_SECTION_NAME: 'COM1_USART'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'RS-485-1'
+_NODE_ID: 0
+_IECIN: %IB6.0
+_IECOUT: %QB6.0
+_IECDIAG: %MB6.0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'RS-485-1'
+_PARAM 2: 0, '9600'
+_PARAM 3: 0, 'NO PARITY CHECK'
+_PARAM 4: 0, '8 bits'
+_PARAM 5: 0, 'One stop bit'
+_PARAM 6: 0, 'RS485'
+_PARAM 7: 0, 'RTU'
+_PARAM 8: 0, '200'
+_PARAM 9: 0, 'No'
+_END_PARAMETER
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2000'
+_INDEX_IN_PARENT: '2'
+_MODULE_NAME: 'Universal Modbus device'
+_NODE_ID: 1
+_IECIN: %IB6.1
+_IECOUT: %QB6.1
+_IECDIAG: %MB6.1
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'ESP8266'
+_PARAM 2: 0, '10:0:0:223'
+_PARAM 3: 0, '500'
+_PARAM 4: 0, '502'
+_PARAM 5: 0, 'Serial'
+_PARAM 6: 0, '1'
+_PARAM 7: 0, 'By poll time'
+_PARAM 8: 0, '100'
+_PARAM 9: 0, 'No'
+_PARAM 10: 0, '0'
+_PARAM 11: 0, 'Trace_mode'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ComChannel'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Command (0xff - Start)'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QB6.1.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 0
+_IECIN: %IB6.1.0
+_IECOUT: %QB6.1.0
+_IECDIAG: %MB6.1.0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '0'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_DefaultTarget'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.0.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 1
+_IECIN: %IB6.1.1
+_IECOUT: %QB6.1.1
+_IECDIAG: %MB6.1.1
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '1'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_CurrentAngle'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.1.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 2
+_IECIN: %IB6.1.2
+_IECOUT: %QB6.1.2
+_IECDIAG: %MB6.1.2
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '2'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_TargetAngle'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.2.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 3
+_IECIN: %IB6.1.3
+_IECOUT: %QB6.1.3
+_IECDIAG: %MB6.1.3
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '3'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_Cycle'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.3.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 4
+_IECIN: %IB6.1.4
+_IECOUT: %QB6.1.4
+_IECDIAG: %MB6.1.4
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '4'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_Done'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.4.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 5
+_IECIN: %IB6.1.5
+_IECOUT: %QB6.1.5
+_IECDIAG: %MB6.1.5
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '5'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_Mode'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.5.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2004'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register output module'
+_NODE_ID: 6
+_IECIN: %IB6.1.6
+_IECOUT: %QB6.1.6
+_IECDIAG: %MB6.1.6
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register'
+_PARAM 2: 0, '6'
+_PARAM 3: 0, 'Write multiple registers(0x10)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_out_Pedals'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.6.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2003'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register input module'
+_NODE_ID: 7
+_IECIN: %IB6.1.7
+_IECOUT: %QB6.1.7
+_IECDIAG: %MB6.1.7
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register input module'
+_PARAM 2: 0, '9'
+_PARAM 3: 0, 'Read holding Registers  (0x03)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_in_Command'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.7.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID2003'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Register input module'
+_NODE_ID: 8
+_IECIN: %IB6.1.8
+_IECOUT: %QB6.1.8
+_IECDIAG: %MB6.1.8
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Register input module'
+_PARAM 2: 0, '10'
+_PARAM 3: 0, 'Read holding Registers  (0x03)'
+_PARAM 8: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: 'mb_in_WebTarget'
+_COMMENT: ''
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1.8.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+_END_MODULE
+_END_MODULE
+_END_MODULE
+PLC_END
+
+
+RESOURCE
+{event_task : 'start','Called when program starts','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,1,27847}
+{event_task : 'stop','Called when program stops','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,2,27847}
+{event_task : 'before_reset','Called before reset takes place','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,3,27847}
+{event_task : 'after_reset','Called after reset took place','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,4,27847}
+{event_task : 'debug_loop','Debug loop at breakpoint','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,31,27847}
+{event_task : 'Timer','Timer(20mks)(only in PLC110)','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,1000,27847}
+
+END_RESOURCE
+
+
+_ALARMCONFIG
+_ALARMCONFIGNEXTTEXTID : 10002
+_ALARMCONFIGFORMATS : 'HH$':$'mm$':$'ss','dd$'-$'MM$'-$'yyyy'
+_ALARMCLASSLIST : 1
+_ALARMCLASSID : 0
+_ALARMCLASSACKTYPE : 0
+_ALARMCLASSNAME : 'DEFAULT'
+_ALARMCLASSDESCRIPTION : ''
+_ALARMCLASSBGCOLORS : 16777215,16777215,16777215
+_ALARMCLASSTEXTCOLORS : 3394560,255,16711680
+_ALARMCLASSBITMAPS : '','',''
+_ALARMACTIONLIST : 0
+(* @ALARMCLASSRESETCOLORS := '_ALARMCLASSRESETCOLORS: 33023,16777215' *)
+(* @ALARMCLASSRESETBITMAP := '_ALARMCLASSRESETBITMAP: $'$'' *)
+_ALARMGROUPLISTNAME : 'Groups'
+_ALARMGROUPPATH : 'Groups'
+_ALARMGROUPLIST : 0
+_VISUALSETTINGSFLAGS : 0,0,0,0
+_VISUALSETTINGSFLAGS : '','',''
+_VISUALSETTINGSDYNTEXTFILECOUNT : 0
+
+(* @ALARMCONFIGFLAGS := '_ALARMCONFIGFLAGS: 4' *)
+(* @ALARMCONFIGGLOBALDB_STR := '_ALARMCONFIGGLOBALDB_STRINGS: $'$',$'$',$'$',$'$'' *)
+(* @ALARMCONFIGGLOBALDB_NUM := '_ALARMCONFIGGLOBALDB_NUMBERS: 0,0' *)
+_END_ALARMCONFIG
+
+
+LIBRARY
+ANALYZATION.LIB 5.10.99 09:05:06
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 2
+AnalyzeExpression: 0
+AppendErrorString: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+LIBRARY
+IECSFC.LIB 13.4.06 15:51:28
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 1
+SFCActionControl: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+LIBRARY
+STANDARD.LIB 4.10.05 11:14:46
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 21
+CONCAT: 0
+CTD: 0
+CTU: 0
+CTUD: 0
+DELETE: 0
+F_TRIG: 0
+FIND: 0
+INSERT: 0
+LEFT: 0
+LEN: 0
+MID: 0
+R_TRIG: 0
+REPLACE: 0
+RIGHT: 0
+RS: 0
+RTC: 0
+SEMA: 0
+SR: 0
+TOF: 0
+TON: 0
+TP: 0
+NumOfGVLs: 0
+END_LIBRARY
+
+
+
+_WORKSPACE
+_GLOBALVISUALSETTINGS
+_VISUALSETTINGSFLAGS : 0,0,0,0
+_VISUALSETTINGSFLAGS : '','',''
+_VISUALSETTINGSDYNTEXTFILECOUNT : 0
+_VISUALBITMAPLISTCOUNT : 0
+_END_GLOBALVISUALSETTINGS
+_END_WORKSPACE

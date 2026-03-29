@@ -1,0 +1,846 @@
+
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+PROGRAM PLC_PRG
+VAR
+    enableStart : BOOL; (* D5 - Enable *)
+    btnD7 : BOOL;       (* D7 - Button *)
+    btnD8 : BOOL;       (* D8 - Reverse Button *)
+    enableEdge : R_TRIG; (* rising edge detector for enable *)
+    startEdge : R_TRIG; (* rising edge detector for start button *)
+    startEdgeD8 : R_TRIG; (* rising edge detector for reverse button *)
+    encAEdge : R_TRIG;  (* encoder A rising edge detector *)
+    encBEdge : R_TRIG;  (* encoder B rising edge detector *)
+    resetBtn : BOOL;    (* reset button local read *)
+    resetEdgeBtn : R_TRIG; (* rising edge detector for reset button *)
+
+    (* Beeper timers/FBs for 3 short beeps over 2s *)
+    gBeepStart : BOOL; (* start beeper sequence flag, local control *)
+    tBeepTotal : TON;  (* total beeper duration *)
+    tBeepDelay1 : TON; (* beep 1 delay (0ms) *)
+    tBeepDelay2 : TON; (* beep 2 delay (600ms) *)
+    tBeepDelay3 : TON; (* beep 3 delay (1200ms) *)
+    rTrigBeep1 : R_TRIG;
+    rTrigBeep2 : R_TRIG;
+    rTrigBeep3 : R_TRIG;
+    tpBeep : TP;       (* pulse timer to generate short beep *)
+    tpTrigger : BOOL;  (* internal trigger for TP *)
+    (* Error beeper: 6 short pulses (150ms) *)
+    errorBeepStart : BOOL;
+    tErrTotal : TON;
+    tErrDelay1 : TON;
+    tErrDelay2 : TON;
+    tErrDelay3 : TON;
+    tErrDelay4 : TON;
+    tErrDelay5 : TON;
+    tErrDelay6 : TON;
+    rTrigErr1 : R_TRIG;
+    rTrigErr2 : R_TRIG;
+    rTrigErr3 : R_TRIG;
+    rTrigErr4 : R_TRIG;
+    rTrigErr5 : R_TRIG;
+    rTrigErr6 : R_TRIG;
+    tpErr : TP;
+    arrivedTargetSignalled : BOOL;
+    arrivedHomeSignalled : BOOL;
+    (* Start-timeout / alarm logic *)
+    startTimeoutActive : BOOL;
+    tStartTimeout : TON;    (* 2s timer to detect no movement after pedal press *)
+    errorLock : BOOL;       (* when TRUE, outputs disabled until reset *)
+    (* desiredMove: 1 = forward, -1 = reverse, 0 = none *)
+    desiredMove : INT;
+    encDelta : INT;         (* +1/-1 from encoder edge direction *)
+    (* DO9 alarm pulse and enable (D5) long beep *)
+    do9PulseTrigger : BOOL;
+    tpDO9 : TP;
+    tpEnable : TP;
+    blockedPedal : INT;    (* 0=none, 7=forward pedal blocked, 8=reverse pedal blocked *)
+    prevEnableStart : BOOL; (* previous scan state of D5 for falling-edge detection *)
+    manualModeLocal : BOOL;
+    (* local cycle debug / runtime indicator handled in globals too *)
+END_VAR
+
+(* @END_DECLARATION := '0' *)
+(* Read inputs *)
+enableStart := gDI_5; (* D5 used as manual mode switch *)
+(* manualMode TRUE = D5 pressed = manual mode (free rotation). FALSE = normal mode with limits *)
+manualModeLocal := enableStart;
+btnD7 := gDI_7;
+btnD8 := gDI_8;
+
+(* Detect falling edge of D5 (manual -> normal): when prevEnableStart was TRUE and now FALSE *)
+IF (prevEnableStart AND NOT enableStart) THEN
+    (* manual turned OFF -> reset angle and start normal cycle 1 immediately *)
+    gCurrentAngle := 0.0;
+    gEncoderCount := 0;
+    gCycle := 1;
+    gTargetAngle := gDefaultTarget;
+    gDO_10 := FALSE;
+    gDO_11 := FALSE;
+    gDO_12 := FALSE;
+    gStatus := 0;
+END_IF;
+
+(* Edge detectors *)
+enableEdge(CLK := enableStart);
+startEdge(CLK := btnD7);
+startEdgeD8(CLK := btnD8);
+encAEdge(CLK := gEncoderA);
+encBEdge(CLK := gEncoderB);
+
+(* Set `gTargetAngle` according to `gCycle` rule:
+   - gCycle = 1 -> use `gDefaultTarget` (e.g., 45°)
+   - gCycle = 2 -> use 0.0 (home)
+   - otherwise -> use `gDefaultTarget`
+   This enforces the user's rule deterministically each scan. *)
+IF NOT manualModeLocal THEN
+    IF gCycle = 1 THEN
+        gTargetAngle := gDefaultTarget;
+    ELSIF gCycle = 2 THEN
+        gTargetAngle := 0.0;
+    ELSE
+        gTargetAngle := gDefaultTarget;
+    END_IF;
+END_IF;
+
+(* On system enable rising edge: clear latched alarms and reset outputs (do not reset encoder/angle) *)
+(* On enable rising edge: manual mode entered. Do not reset encoder/angle here.
+    Reset on manual->normal transition (falling edge) is handled separately. *)
+
+(* Encoder counting (count on rising edge of A; direction by B); adjust direction later if inverted *)
+IF encAEdge.Q THEN
+    IF gEncoderB THEN
+        encDelta := 1;
+        gEncoderCount := gEncoderCount + 1;
+    ELSE
+        encDelta := -1;
+        gEncoderCount := gEncoderCount - 1;
+    END_IF;
+    (* Cancel start-timeout only if motion is toward desiredMove *)
+    IF (startTimeoutActive) AND (desiredMove <> 0) THEN
+        IF (encDelta = desiredMove) THEN
+            startTimeoutActive := FALSE;
+            desiredMove := 0; (* movement detected toward target - disarm *)
+        END_IF;
+    END_IF;
+END_IF;
+
+(* Ensure counts-per-rev is valid and compute current angle from encoder count *)
+IF (gCalibCountsPerRev = 0) THEN
+    gCalibCountsPerRev := 360; (* default PPR *)
+END_IF;
+
+(* Calculate current angle from encoder count. Inverted sign to change rotation direction *)
+gCurrentAngle := - DINT_TO_REAL(gEncoderCount) * 360.0 / DINT_TO_REAL(gCalibCountsPerRev);
+
+
+
+(* Start bending only when enabled and start button pressed (rising edge) *)
+(* Hold-to-run logic: outputs only active while pedal held, enable pressed,
+   and within allowed range. Also prevent both pedals operating simultaneously. *)
+(* Forward DO10: allowed only when enable pressed, forward pedal pressed, reverse pedal NOT pressed,
+   and current angle is strictly less than target (so it won't start at target). *)
+(* In manual mode allow free rotation both directions (no angle limits).
+    In normal mode enforce angle limits to prevent moving past endpoints. *)
+IF manualModeLocal THEN
+    (* Manual mode: allow each pedal to directly control its output without blocking the other *)
+    gDO_10 := enableStart AND btnD7;
+    gDO_11 := enableStart AND btnD8;
+ELSE
+    (* Normal mode: D5 is false. Drive outputs based on pedals and angle limits (no D5 enable required). *)
+    gDO_10 := btnD7 AND (gCurrentAngle < gTargetAngle);  (* forward only if below target *)
+    gDO_11 := btnD8 AND (gCurrentAngle > 0.0);           (* reverse only if above zero *)
+END_IF;
+
+(* Update movement status: 1 = moving, 0 = stopped, 2 = in-position *)
+IF (gDO_10 OR gDO_11) THEN
+    gStatus := 1;
+ELSIF gDO_12 THEN
+    gStatus := 2;
+ELSE
+    gStatus := 0;
+END_IF;
+
+(* When running, check if target reached: switch off motor (DO10) and turn on in-position (DO12) *)
+(* While moving forward, stop exactly at target and signal arrival. Motor must not run beyond target. *)
+IF NOT manualModeLocal THEN
+    IF (gStatus = 1) AND (gDO_10) THEN
+        IF (gCurrentAngle >= gTargetAngle) THEN
+            gDO_10 := FALSE;
+            gDO_12 := TRUE;
+            gStatus := 2;    (* 2 = In position *)
+            gCycle := 2;     (* 2 = At target *)
+            IF NOT arrivedTargetSignalled THEN
+                gBeepStart := TRUE; (* normal arrival beeper, only once per arrival *)
+                arrivedTargetSignalled := TRUE;
+                (* Arrival: set cycle to At-target; `gTargetAngle` mapping will switch target to 0.0 next scan. *)
+                arrivedHomeSignalled := FALSE; (* allow home arrival signalling later *)
+                (* In normal mode, pulse DO9 for 1s to indicate successful arrival *)
+                do9PulseTrigger := TRUE;
+            END_IF;
+        END_IF;
+    END_IF;
+END_IF;
+
+(* Reverse start: handle on rising edge of D8 (like forward). If at home (0.0) -> error beep; else start reverse cycle. *)
+(* legacy edge-start block removed: hold-to-run logic controls DO11 directly *)
+
+(* Reverse arrival: while moving reverse (gDO_11 active), stop at 0°, zero encoder and switch to cycle 1 (0->default). *)
+IF NOT manualModeLocal THEN
+    IF (gStatus = 1) AND (gDO_11) THEN
+        IF (gCurrentAngle <= 0.0) THEN
+            gDO_11 := FALSE;
+            gStatus := 0;                 (* 0 = Stop at home *)
+            gEncoderCount := 0;
+            gCurrentAngle := 0.0;
+            IF NOT arrivedHomeSignalled THEN
+                gBeepStart := TRUE;       (* signal arrival at 0° with normal beeper, once *)
+                arrivedHomeSignalled := TRUE;
+                gCycle := 1; (* Home -> next cycle is 1: 0 -> gDefaultTarget *)
+                arrivedTargetSignalled := FALSE; (* allow forward arrival signalling later *)
+            END_IF;
+        END_IF;
+    END_IF;
+END_IF;
+
+    (* clear desiredMove and timeout when reverse pedal released *)
+    IF NOT btnD8 THEN
+            gDO_11 := FALSE; (* stop reverse motor when reverse pedal released *)
+            desiredMove := 0;
+            startTimeoutActive := FALSE;
+            IF gStatus = 1 THEN
+                gStatus := 0;
+            END_IF;
+    END_IF;
+
+(* Remove continuous-held error triggers; use rising-edge checks only. *)
+
+(* Reset arrival latches when moving away from limits *)
+IF (gCurrentAngle < gTargetAngle) THEN
+    arrivedTargetSignalled := FALSE;
+END_IF;
+IF (gCurrentAngle > 0.0) THEN
+    arrivedHomeSignalled := FALSE;
+END_IF;
+
+(* If in normal mode and we've reached (or passed) the target but didn't arrive via motion,
+   signal the 1s DO9 pulse once. This covers cases where `gCurrentAngle` is set externally. *)
+IF NOT manualModeLocal THEN
+    IF (gCurrentAngle >= gTargetAngle) AND (NOT arrivedTargetSignalled) THEN
+        do9PulseTrigger := TRUE;
+        arrivedTargetSignalled := TRUE;
+    END_IF;
+END_IF;
+
+(* Start timeout timer/timeout alarm disabled while working in simplified 2-cycle mode. *)
+(* tStartTimeout(IN := startTimeoutActive, PT := T#2S);
+IF tStartTimeout.Q AND startTimeoutActive THEN
+    do9PulseTrigger := TRUE; (* start DO9 TP *)
+    errorLock := TRUE;    (* latch error until reset *)
+    gDO_10 := FALSE;      (* ensure motors are off *)
+    gDO_11 := FALSE;
+    startTimeoutActive := FALSE;
+    desiredMove := 0;
+    errorBeepStart := TRUE; (* give audible alarm pattern too *)
+END_IF; *)
+
+(* Reset handled on `D5` rising edge (enableEdge) to clear latched alarm and error beeps.) *)
+
+(* DO9 pulse TP and enable long-beep TP disabled for simplified mode *)
+(* DO9 pulse TP: 1s pulse on successful arrival in normal mode *)
+tpDO9(IN := do9PulseTrigger, PT := T#1S);
+gDO_9 := tpDO9.Q; (* DO9 is driven by TP for 1s pulse *)
+IF tpDO9.Q THEN
+    do9PulseTrigger := FALSE;
+END_IF;
+
+(* Only drive DO9 and beeper for blocked-pedal alarms while that pedal remains pressed. *)
+IF blockedPedal = 7 THEN
+    (* forward pedal is the blocked one; only keep alarm while forward pedal is pressed *)
+    IF NOT btnD7 THEN
+        blockedPedal := 0; (* clear when pedal released *)
+    END_IF;
+ELSIF blockedPedal = 8 THEN
+    IF NOT btnD8 THEN
+        blockedPedal := 0;
+    END_IF;
+END_IF;
+
+(* Long enable beep on rising edge of enable (D5) for 2s) disabled temporarily *)
+(* tpEnable(IN := enableEdge.Q, PT := T#2S); *)
+
+(* Reset button handling: `gDI_11` resets alarm latch only (does not change stored angle or gCycle) *)
+resetBtn := gDI_11;
+resetEdgeBtn(CLK := resetBtn);
+IF resetEdgeBtn.Q THEN
+    errorLock := FALSE;      (* clear hard alarm latch *)
+    errorBeepStart := FALSE; (* stop error beeper *)
+    do9PulseTrigger := FALSE;(* stop DO9 pulse if active *)
+    blockedPedal := 0;       (* clear any blocked pedal on reset *)
+END_IF;
+
+(* Save previous enable state for falling-edge detection next scan *)
+prevEnableStart := enableStart;
+
+
+(* Beeper sequence control: three short pulses (200ms) at 0ms, 600ms and 1200ms within a 2s window *)
+tBeepTotal(IN := gBeepStart, PT := T#2S);
+tBeepDelay1(IN := gBeepStart, PT := T#0MS);
+tBeepDelay2(IN := gBeepStart, PT := T#600MS);
+tBeepDelay3(IN := gBeepStart, PT := T#1200MS);
+rTrigBeep1(CLK := tBeepDelay1.Q);
+rTrigBeep2(CLK := tBeepDelay2.Q);
+rTrigBeep3(CLK := tBeepDelay3.Q);
+tpBeep(IN := (rTrigBeep1.Q OR rTrigBeep2.Q OR rTrigBeep3.Q), PT := T#200MS);
+(* Normal beeper output *)
+
+(* Error beeper sequence: six short pulses 150ms spaced by 150ms over ~1.8s *)
+tErrTotal(IN := errorBeepStart, PT := T#1800MS);
+tErrDelay1(IN := errorBeepStart, PT := T#0MS);
+tErrDelay2(IN := errorBeepStart, PT := T#300MS);
+tErrDelay3(IN := errorBeepStart, PT := T#600MS);
+tErrDelay4(IN := errorBeepStart, PT := T#900MS);
+tErrDelay5(IN := errorBeepStart, PT := T#1200MS);
+tErrDelay6(IN := errorBeepStart, PT := T#1500MS);
+rTrigErr1(CLK := tErrDelay1.Q);
+rTrigErr2(CLK := tErrDelay2.Q);
+rTrigErr3(CLK := tErrDelay3.Q);
+rTrigErr4(CLK := tErrDelay4.Q);
+rTrigErr5(CLK := tErrDelay5.Q);
+rTrigErr6(CLK := tErrDelay6.Q);
+tpErr(IN := (rTrigErr1.Q OR rTrigErr2.Q OR rTrigErr3.Q OR rTrigErr4.Q OR rTrigErr5.Q OR rTrigErr6.Q), PT := T#150MS);
+
+(* Combine beepers: error beeper overrides normal beeper if active; include enable long-beep *)
+gBeeper := tpErr.Q OR tpBeep.Q OR tpEnable.Q;
+IF tBeepTotal.Q THEN
+    gBeepStart := FALSE;
+END_IF;
+IF tErrTotal.Q THEN
+    errorBeepStart := FALSE;
+END_IF;
+
+(* System-disable gating based on `D5` removed because `D5` is used as manual-mode switch.
+   If you need a separate global system-enable input, restore checks here using that input. *)
+END_PROGRAM
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+TYPE COMSETTINGS_FALLBACK : STRUCT
+    Port : INT; (* PORTS in library; INT used locally to avoid enum conflicts *)
+    dwBaudRate : DWORD;
+    byStopBits : BYTE;
+    byParity : BYTE;
+    dwTimeout : DWORD;
+    dwBufferSize : DWORD;
+    dwScan : DWORD;
+END_STRUCT
+END_TYPE
+
+(* @END_DECLARATION := '0' *)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Global_Variables' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+(* Global variables moved to test3.exp to avoid duplicate declarations and AT bindings.
+   See test3.exp for `VAR_GLOBAL RETAIN` with IO, encoder, outputs and Modbus registers. *)
+(* @OBJECT_END := 'Global_Variables' *)
+(* @CONNECTIONS := Global_Variables
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)
+
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Variable_Configuration_1' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+VAR_CONFIG
+END_VAR
+(* @OBJECT_END := 'Variable_Configuration_1' *)
+(* @CONNECTIONS := Variable_Configuration_1
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)
+
+PLC_CONFIGURATION
+_GLOBAL
+_VERSION: 3
+_AUTOADR: 1
+_CHECKADR: 1
+_SAVECONFIGFILESINPROJECT: 0
+_END_GLOBAL
+
+_MODULE: '3S'
+_SECTION_NAME: 'Root'
+_INDEX_IN_PARENT: '-1'
+_MODULE_NAME: 'PLC110_30'
+_NODE_ID: -1
+_IECIN: %IB0
+_IECOUT: %QB0
+_IECDIAG: %MB0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'PLC110-30_v2'
+_PARAM 2: 0, '1'
+_PARAM 3: 0, '1000'
+_END_PARAMETER
+
+_MODULE: '3S'
+_SECTION_NAME: 'I_SIMPLE_INPUT'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'Fast discrete inputs'
+_NODE_ID: 0
+_IECIN: %IB0
+_IECOUT: %QB0
+_IECDIAG: %MB0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Fast discrete inputs'
+_PARAM 2: 0, '10000'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Discrete input 1'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX0.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Discrete input 2'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX0.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID130'
+_INDEX_IN_PARENT: '2'
+_MODULE_NAME: 'Discrete inputs - 16'
+_NODE_ID: 1
+_IECIN: %IB1
+_IECOUT: %QB1
+_IECDIAG: %MB1
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Discrete inputs'
+_PARAM 2: 0, '10'
+_PARAM 3: 0, '16'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ByteInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 discrete inputs'
+_CHANNEL_MODE: 'I'
+_IECADR: %IB1.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %IX1.0.0 '' 'Bit 0'
+_BIT 1: %IX1.0.1 '' 'Bit 1'
+_BIT 2: %IX1.0.2 '' 'Bit 2'
+_BIT 3: %IX1.0.3 '' 'Bit 3'
+_BIT 4: %IX1.0.4 '' 'Bit 4'
+_BIT 5: %IX1.0.5 '' 'Bit 5'
+_BIT 6: %IX1.0.6 '' 'Bit 6'
+_BIT 7: %IX1.0.7 '' 'Bit 7'
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'ByteInput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 discrete inputs'
+_CHANNEL_MODE: 'I'
+_IECADR: %IB1.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %IX1.1.0 '' 'Bit 0'
+_BIT 1: %IX1.1.1 '' 'Bit 1'
+_BIT 2: %IX1.1.2 '' 'Bit 2'
+_BIT 3: %IX1.1.3 '' 'Bit 3'
+_BIT 4: %IX1.1.4 '' 'Bit 4'
+_BIT 5: %IX1.1.5 '' 'Bit 5'
+_BIT 6: %IX1.1.6 '' 'Bit 6'
+_BIT 7: %IX1.1.7 '' 'Bit 7'
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'OWEN_ID570'
+_INDEX_IN_PARENT: '3'
+_MODULE_NAME: 'Fast discrete outputs'
+_NODE_ID: 2
+_IECIN: %IB2
+_IECOUT: %QB2
+_IECDIAG: %MB2
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Fast discrete outputs'
+_PARAM 2: 0, 'FALSE'
+_PARAM 3: 0, 'FALSE'
+_PARAM 4: 0, 'FALSE'
+_PARAM 5: 0, 'FALSE'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 1'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 2'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '3'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 3'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.2
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '4'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Fast discrete output 4'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX2.3
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID131'
+_INDEX_IN_PARENT: '4'
+_MODULE_NAME: 'Discrete outputs - 8'
+_NODE_ID: 3
+_IECIN: %IB3
+_IECOUT: %QB3
+_IECDIAG: %MB3
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Discrete outputs'
+_PARAM 2: 0, '0'
+_PARAM 3: 0, 'No'
+_PARAM 4: 0, '10'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'ByteOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: '8 discrete outputs'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QB3.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_BIT 0: %QX3.0.0 '' 'Bit 0'
+_BIT 1: %QX3.0.1 '' 'Bit 1'
+_BIT 2: %QX3.0.2 '' 'Bit 2'
+_BIT 3: %QX3.0.3 '' 'Bit 3'
+_BIT 4: %QX3.0.4 '' 'Bit 4'
+_BIT 5: %QX3.0.5 '' 'Bit 5'
+_BIT 6: %QX3.0.6 '' 'Bit 6'
+_BIT 7: %QX3.0.7 '' 'Bit 7'
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID103'
+_INDEX_IN_PARENT: '5'
+_MODULE_NAME: 'Special input'
+_NODE_ID: 4
+_IECIN: %IB4
+_IECOUT: %QB4
+_IECDIAG: %MB4
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Special input'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitInput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Special input'
+_CHANNEL_MODE: 'I'
+_IECADR: %IX4.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'ID104'
+_INDEX_IN_PARENT: '6'
+_MODULE_NAME: 'Special output'
+_NODE_ID: 5
+_IECIN: %IB5
+_IECOUT: %QB5
+_IECDIAG: %MB5
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'Special output'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'BitOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Special output'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QX5.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+_END_MODULE
+
+_MODULE: '3S'
+_SECTION_NAME: 'MODBUS_MASTER_ID450'
+_INDEX_IN_PARENT: '7'
+_MODULE_NAME: 'ModBus (Master)'
+_NODE_ID: 6
+_IECIN: %IB6
+_IECOUT: %QB6
+_IECDIAG: %MB6
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'ModBus (Master)'
+_PARAM 2: 0, 'No'
+_END_PARAMETER
+
+_CHANNEL
+_SECTION_NAME: 'DWordOutput'
+_INDEX_IN_PARENT: '1'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Last address'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QD6.0
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_CHANNEL
+_SECTION_NAME: 'WordOutput'
+_INDEX_IN_PARENT: '2'
+_SYMBOLIC_NAME: ''
+_COMMENT: 'Last error'
+_CHANNEL_MODE: 'Q'
+_IECADR: %QW6.1
+
+_PARAMETER
+_PARAM 1: 0, 'Enter name'
+_END_PARAMETER
+_END_CHANNEL
+
+_MODULE: '3S'
+_SECTION_NAME: 'COM1_USART'
+_INDEX_IN_PARENT: '1'
+_MODULE_NAME: 'RS-485-1'
+_NODE_ID: 0
+_IECIN: %IB6.0
+_IECOUT: %QB6.0
+_IECDIAG: %MB6.0
+_DOWNLOAD: 1
+_EXCLUDEFROMAUTOADR: 0
+_COMMENT: ''
+
+_PARAMETER
+_PARAM 1: 0, 'RS-485-1'
+_PARAM 2: 0, '115200'
+_PARAM 3: 0, 'NO PARITY CHECK'
+_PARAM 4: 0, '8 bits'
+_PARAM 5: 0, 'One stop bit'
+_PARAM 6: 0, 'RS485'
+_PARAM 7: 0, 'ASCII'
+_PARAM 8: 0, '0'
+_PARAM 9: 0, 'No'
+_END_PARAMETER
+_END_MODULE
+_END_MODULE
+_END_MODULE
+PLC_END
+
+
+RESOURCE
+{event_task : 'start','Called when program starts','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,1,27847}
+{event_task : 'stop','Called when program stops','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,2,27847}
+{event_task : 'before_reset','Called before reset takes place','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,3,27847}
+{event_task : 'after_reset','Called after reset took place','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,4,27847}
+{event_task : 'debug_loop','Debug loop at breakpoint','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,31,27847}
+{event_task : 'Timer','Timer(20mks)(only in PLC110)','','FUNCTION systemevent: DWORD$R$NVAR_INPUT$R$N$TdwEvent: INT;$R$N$TdwFilter: INT;$R$N$TdwOwner: INT;$R$NEND_VAR$R$N'}{event_task_info : 0,1000,27847}
+
+END_RESOURCE
+
+
+_ALARMCONFIG
+_ALARMCONFIGNEXTTEXTID : 10002
+_ALARMCONFIGFORMATS : 'HH$':$'mm$':$'ss','dd$'-$'MM$'-$'yyyy'
+_ALARMCLASSLIST : 1
+_ALARMCLASSID : 0
+_ALARMCLASSACKTYPE : 0
+_ALARMCLASSNAME : 'DEFAULT'
+_ALARMCLASSDESCRIPTION : ''
+_ALARMCLASSBGCOLORS : 16777215,16777215,16777215
+_ALARMCLASSTEXTCOLORS : 3394560,255,16711680
+_ALARMCLASSBITMAPS : '','',''
+_ALARMACTIONLIST : 0
+(* @ALARMCLASSRESETCOLORS := '_ALARMCLASSRESETCOLORS: 33023,16777215' *)
+(* @ALARMCLASSRESETBITMAP := '_ALARMCLASSRESETBITMAP: $'$'' *)
+_ALARMGROUPLISTNAME : 'Groups'
+_ALARMGROUPPATH : 'Groups'
+_ALARMGROUPLIST : 0
+_VISUALSETTINGSFLAGS : 0,0,0,0
+_VISUALSETTINGSFLAGS : '','',''
+_VISUALSETTINGSDYNTEXTFILECOUNT : 0
+
+(* @ALARMCONFIGFLAGS := '_ALARMCONFIGFLAGS: 4' *)
+(* @ALARMCONFIGGLOBALDB_STR := '_ALARMCONFIGGLOBALDB_STRINGS: $'$',$'$',$'$',$'$'' *)
+(* @ALARMCONFIGGLOBALDB_NUM := '_ALARMCONFIGGLOBALDB_NUMBERS: 0,0' *)
+_END_ALARMCONFIG
+
+
+LIBRARY
+ANALYZATION.LIB 5.10.99 09:05:06
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 2
+AnalyzeExpression: 0
+AppendErrorString: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+LIBRARY
+IECSFC.LIB 13.4.06 15:51:28
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 1
+SFCActionControl: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY
+
+LIBRARY
+STANDARD.LIB 4.10.05 11:14:46
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 21
+CONCAT: 0
+CTD: 0
+CTU: 0
+CTUD: 0
+DELETE: 0
+F_TRIG: 0
+FIND: 0
+INSERT: 0
+LEFT: 0
+LEN: 0
+MID: 0
+R_TRIG: 0
+REPLACE: 0
+RIGHT: 0
+RS: 0
+RTC: 0
+SEMA: 0
+SR: 0
+TOF: 0
+TON: 0
+TP: 0
+NumOfGVLs: 0
+END_LIBRARY
+
+
+
+_WORKSPACE
+_GLOBALVISUALSETTINGS
+_VISUALSETTINGSFLAGS : 0,0,0,0
+_VISUALSETTINGSFLAGS : '','',''
+_VISUALSETTINGSDYNTEXTFILECOUNT : 0
+_VISUALBITMAPLISTCOUNT : 0
+_END_GLOBALVISUALSETTINGS
+_END_WORKSPACE

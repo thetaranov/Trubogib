@@ -1,0 +1,902 @@
+/* ESP8266_Trubogib_Debug2.ino
+   Trubogib ESP8266 - Modbus RTU Slave + Web Debug Interface
+   
+   Features:
+   - Modbus RTU slave (addr=1) supporting 0x03 (read) and 0x10 (write multiple)
+   - holdingRegs[16] register map
+   - Web UI: angle display + gDefaultTarget setter + ZERO button + full Modbus diagnostics
+   - ZERO button in web UI sends command 3 to PLC via Modbus register 9
+   - Dual AJAX polling: /a every 50ms for angle, /data every 2s for diagnostics
+   - CPU set to 160MHz for maximum performance
+   - Comprehensive Modbus debug: frame counts, CRC errors, raw hex logging
+
+   RS-485 wiring: TX=GPIO4, RX=GPIO14, DE=GPIO5
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <SoftwareSerial.h>
+
+extern "C" {
+  #include "user_interface.h"  /* for system_update_cpu_freq(160) */
+}
+
+#define MODBUS_BAUD 9600
+#define MODBUS_ADDR 1
+
+/* RS485 pins (SoftwareSerial) */
+#define RS485_TX_PIN 4
+#define RS485_RX_PIN 14
+#define RS485_DE_PIN 5
+
+SoftwareSerial rs485(RS485_RX_PIN, RS485_TX_PIN);
+
+ESP8266WebServer server(80);
+
+uint16_t holdingRegs[16];
+
+#define REG_DEFAULT_TARGET 0
+#define REG_CURRENT_ANGLE 1
+#define REG_TARGET_ANGLE 2
+#define REG_CYCLE 3
+#define REG_DONE 4
+#define REG_MODE 5
+#define REG_PEDALS 6
+#define REG_COMMAND 9
+#define REG_WEB_TARGET 10
+
+/* Timing */
+unsigned long lastCmdMillis = 0;
+uint16_t lastCmdValue = 0;
+unsigned long lastModbusOkTime = 0;
+unsigned long webTargetSetTime = 0;  /* millis when WebTarget was set from web UI */
+bool webTargetPending = false;       /* true = value waiting for PLC to read */
+unsigned long webTargetReadCount = 0;   /* how many times PLC read reg10 while non-zero */
+uint16_t webTargetLastSentValue = 0;    /* last non-zero value sent to PLC for reg10 */
+
+/* Modbus debug counters */
+unsigned long mbFramesRx = 0;        /* Total frames received (valid CRC) */
+unsigned long mbFramesTx = 0;        /* Total responses sent */
+unsigned long mbCrcErrors = 0;       /* CRC mismatch count */
+unsigned long mbAddrMismatch = 0;    /* Wrong address count */
+unsigned long mbFuncErrors = 0;      /* Unsupported function count */
+unsigned long mbWriteCount = 0;      /* 0x10 write count */
+unsigned long mbReadCount = 0;       /* 0x03 read count */
+unsigned long mbShortFrames = 0;     /* Frames too short */
+unsigned long mbBytesRx = 0;         /* Total bytes received */
+uint8_t lastRxFrame[64];             /* Last received frame (for debug) */
+int lastRxFrameLen = 0;
+uint8_t lastTxFrame[64];             /* Last sent frame (for debug) */
+int lastTxFrameLen = 0;
+uint16_t lastCrcExpected = 0;        /* Last expected CRC (on error) */
+uint16_t lastCrcReceived = 0;        /* Last received CRC (on error) */
+
+/* CRC Error History - ring buffer of last 5 errors */
+#define CRC_HIST_SIZE 5
+struct CrcErrorEntry {
+  unsigned long timestamp;    /* millis when error occurred */
+  uint16_t crcExpected;
+  uint16_t crcReceived;
+  uint8_t frameData[32];     /* first 32 bytes of bad frame */
+  int frameLen;
+};
+CrcErrorEntry crcHistory[CRC_HIST_SIZE];
+int crcHistIdx = 0;                  /* next write position */
+int crcHistCount = 0;                /* total entries stored */
+unsigned long mbTotalFrames = 0;     /* Total frames attempted (good + bad CRC) */
+unsigned long mbFramesSplit = 0;     /* Concatenated frames successfully split */
+
+/* CRC16 Modbus */
+uint16_t crc16(const uint8_t *buf, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (int i = 0; i < 8; i++) {
+      if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+      else crc >>= 1;
+    }
+  }
+  return crc;
+}
+
+void rs485TxEnable(bool en) {
+  digitalWrite(RS485_DE_PIN, en ? HIGH : LOW);
+}
+
+void sendResponse(uint8_t *buf, int len) {
+  /* Save for debug */
+  lastTxFrameLen = len < 64 ? len : 64;
+  memcpy(lastTxFrame, buf, lastTxFrameLen);
+  
+  rs485TxEnable(true);
+  delayMicroseconds(100);
+  rs485.write(buf, len);
+  rs485.flush();
+  delayMicroseconds(200);
+  rs485TxEnable(false);
+  /* Post-TX settling time - ensure clean transition to RX mode */
+  delayMicroseconds(500);
+  mbFramesTx++;
+}
+
+/* ===================== WEB UI ===================== */
+const char INDEX_HTML[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Трубогиб Debug</title>
+  <style>
+    body { font-family: monospace; text-align: center; margin: 0; padding: 10px; background: #1a1a2e; color: #e0e0e0; }
+    .card { background: #16213e; border-radius: 8px; padding: 15px; margin: 8px auto; max-width: 500px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }
+    h1 { margin-top: 0; color: #0ff; font-size: 20px; }
+    h2 { color: #0af; font-size: 16px; margin: 5px 0; }
+    .value { font-size: 72px; font-weight: bold; color: #0f0; margin: 5px 0; }
+    .label { color: #888; font-size: 12px; text-transform: uppercase; }
+    .status { font-size: 12px; margin-bottom: 5px; }
+    .status.ok { color: #0f0; }
+    .status.err { color: #f44; }
+    
+    input { padding: 8px; font-size: 16px; width: 80px; text-align: center; 
+            border: 1px solid #0af; border-radius: 4px; background: #0d1b2a; color: #fff; }
+    button { background: #0af; color: #000; border: none; padding: 10px 20px; 
+             font-size: 14px; border-radius: 4px; margin: 5px; cursor: pointer; font-weight: bold; }
+    button:active { opacity: 0.7; }
+    .btn-zero { background: #f80; color: #000; }
+    .btn-zero:hover { background: #fa0; }
+    
+    .row { display: flex; justify-content: center; align-items: center; gap: 10px; margin: 8px 0; }
+    .mode { font-weight: bold; padding: 4px 10px; border-radius: 4px; 
+            background: #333; display: inline-block; margin: 3px; }
+    
+    table { width: 100%; border-collapse: collapse; font-size: 12px; text-align: left; }
+    td, th { padding: 3px 6px; border-bottom: 1px solid #333; }
+    th { color: #0af; }
+    .val { color: #0f0; font-weight: bold; }
+    .err-val { color: #f44; font-weight: bold; }
+    .hex { color: #ff0; font-size: 11px; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <h1>ТРУБОГИБ — Отладка</h1>
+  
+  <div id="connStatus" class="status err">Соединение...</div>
+  
+  <div class="card">
+    <div class="label">Текущий Угол</div>
+    <div id="angle" class="value">—</div>
+    <div style="text-align:left; max-width:300px; margin:8px auto;">
+      <div class="row" style="justify-content:space-between;">
+        <span class="label">Цель (gDefaultTarget):</span>
+        <span id="defTarget" class="val">—</span><span class="label">°</span>
+      </div>
+      <div class="row" style="justify-content:space-between;">
+        <span class="label">Текущая цель (gTargetAngle):</span>
+        <span id="target" class="val">—</span><span class="label">°</span>
+      </div>
+      <div class="row" style="justify-content:space-between;">
+        <span class="label">Цикл (gCycle):</span>
+        <span id="cycle" class="val">—</span>
+      </div>
+    </div>
+    <div class="row">
+      <span id="mode" class="mode">—</span>
+      <span id="done" class="mode" style="background:#080; color:#0f0; display:none;">ГОТОВО</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Установка целевого угла (°)</h2>
+    <div class="row">
+      <input type="number" id="newTarget" step="1" value="45">
+      <button onclick="setTarget()">Применить</button>
+    </div>
+    <div id="setStatus" class="label" style="color:#0af;"></div>
+    <hr style="border-color:#333; margin:12px 0;">
+    <h2>Обнуление позиции (Калибровка)</h2>
+    <div class="row">
+      <button class="btn-zero" onclick="sendZero()">⟲ ОБНУЛИТЬ</button>
+    </div>
+    <div id="zeroStatus" class="label" style="color:#f80;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Регистры Modbus</h2>
+    <table>
+      <tr><th>Рег</th><th>Название</th><th>Значение</th><th>Raw</th></tr>
+      <tr><td>0</td><td>DefaultTarget</td><td id="r0" class="val">—</td><td id="r0r" class="hex">—</td></tr>
+      <tr><td>1</td><td>CurrentAngle</td><td id="r1" class="val">—</td><td id="r1r" class="hex">—</td></tr>
+      <tr><td>2</td><td>TargetAngle</td><td id="r2" class="val">—</td><td id="r2r" class="hex">—</td></tr>
+      <tr><td>3</td><td>Cycle</td><td id="r3" class="val">—</td><td id="r3r" class="hex">—</td></tr>
+      <tr><td>4</td><td>Done</td><td id="r4" class="val">—</td><td id="r4r" class="hex">—</td></tr>
+      <tr><td>5</td><td>Mode</td><td id="r5" class="val">—</td><td id="r5r" class="hex">—</td></tr>
+      <tr><td>6</td><td>Pedals</td><td id="r6" class="val">—</td><td id="r6r" class="hex">—</td></tr>
+      <tr><td>9</td><td>Command</td><td id="r9" class="val">—</td><td id="r9r" class="hex">—</td></tr>
+      <tr><td>10</td><td>WebTarget</td><td id="r10" class="val">—</td><td id="r10r" class="hex">—</td></tr>
+      <tr><td></td><td>WT Status</td><td id="wtp" class="val">—</td><td id="wtms" class="hex">—</td></tr>
+      <tr><td></td><td>WT PLC Reads</td><td id="wtrc" class="val">0</td><td id="wtlv" class="hex">last=0</td></tr>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Статистика Modbus</h2>
+    <table>
+      <tr><td>Принято фреймов (CRC OK)</td><td id="mbRx" class="val">0</td></tr>
+      <tr><td>Отправлено ответов</td><td id="mbTx" class="val">0</td></tr>
+      <tr><td>Запросов чтения (0x03)</td><td id="mbRead" class="val">0</td></tr>
+      <tr><td>Запросов записи (0x10)</td><td id="mbWrite" class="val">0</td></tr>
+      <tr><td>Ошибки CRC</td><td id="mbCrc" class="err-val">0</td></tr>
+      <tr><td>Неверный адрес</td><td id="mbAddr" class="err-val">0</td></tr>
+      <tr><td>Неизв. функция</td><td id="mbFunc" class="err-val">0</td></tr>
+      <tr><td>Короткие фреймы</td><td id="mbShort" class="err-val">0</td></tr>
+      <tr><td>Склеено (разделено)</td><td id="mbSplit" class="val">0</td></tr>
+      <tr><td>Всего байт RX</td><td id="mbBytes" class="val">0</td></tr>
+      <tr><td>Связь ПЛК</td><td id="mbLink" class="val">—</td></tr>
+    </table>
+  </div>
+  
+  <div class="card">
+    <h2>Последний RX фрейм</h2>
+    <div id="lastRx" class="hex">—</div>
+    <h2 style="margin-top:8px;">Последний TX фрейм</h2>
+    <div id="lastTx" class="hex">—</div>
+    <h2 style="margin-top:8px;">Последняя ошибка CRC</h2>
+    <div id="lastCrcErr" class="hex">—</div>
+  </div>
+
+  <div class="card">
+    <h2>История ошибок CRC (последние 5)</h2>
+    <div id="crcHistory" class="hex">—</div>
+  </div>
+
+<script>
+  /* Fast angle update - lightweight endpoint, every 50ms */
+  function updateAngle() {
+    fetch('/a').then(function(r){return r.text();}).then(function(t) {
+      var parts = t.split(',');
+      if (parts.length >= 7) {
+        document.getElementById('angle').innerText = parts[0] + String.fromCharCode(176);
+        document.getElementById('defTarget').innerText = parts[1];
+        document.getElementById('target').innerText = parts[2];
+        document.getElementById('cycle').innerText = parts[3];
+        var isMan = parts[4] === '1';
+        document.getElementById('mode').innerText = isMan ? 'РУЧНОЙ' : 'АВТО';
+        document.getElementById('mode').style.background = isMan ? '#553' : '#335';
+        document.getElementById('mode').style.color = isMan ? '#ff0' : '#0af';
+        document.getElementById('done').style.display = parts[5] === '1' ? 'inline-block' : 'none';
+        var linkMs = parseInt(parts[6]);
+        if (linkMs < 2000) {
+          document.getElementById('connStatus').innerText = 'PLC: OK (' + linkMs + 'ms)';
+          document.getElementById('connStatus').className = 'status ok';
+        } else {
+          document.getElementById('connStatus').innerText = 'PLC: NO LINK (' + linkMs + 'ms)';
+          document.getElementById('connStatus').className = 'status err';
+        }
+      }
+    }).catch(function(e){});
+  }
+  
+  /* Full diagnostics update - heavy endpoint, every 2s */
+  function updateData() {
+    fetch('/data').then(function(r){return r.json();}).then(function(d) {
+      var regIds = [0,1,2,3,4,5,6,9,10];
+      for (var i = 0; i < regIds.length; i++) {
+        var ri = regIds[i];
+        var raw = d.r[ri];
+        document.getElementById('r'+ri).innerText = raw;
+        document.getElementById('r'+ri+'r').innerText = '0x' + ('0000'+raw.toString(16)).slice(-4);
+      }
+      
+      /* WebTarget pending status */
+      var wtPend = d.wtp ? 'PENDING' : 'idle';
+      document.getElementById('wtp').innerText = wtPend;
+      document.getElementById('wtp').style.color = d.wtp ? '#ff0' : '#888';
+      document.getElementById('wtms').innerText = d.wts + 'ms ago';
+      document.getElementById('wtrc').innerText = d.wtrc;
+      document.getElementById('wtlv').innerText = 'last=' + d.wtlv;
+
+      document.getElementById('mbRx').innerText = d.mb.rx;
+      document.getElementById('mbTx').innerText = d.mb.tx;
+      document.getElementById('mbRead').innerText = d.mb.rd;
+      document.getElementById('mbWrite').innerText = d.mb.wr;
+      document.getElementById('mbCrc').innerText = d.mb.crc;
+      document.getElementById('mbAddr').innerText = d.mb.adr;
+      document.getElementById('mbFunc').innerText = d.mb.fn;
+      document.getElementById('mbShort').innerText = d.mb.sh;
+      document.getElementById('mbSplit').innerText = d.mb.spl || 0;
+      document.getElementById('mbBytes').innerText = d.mb.byt;
+      
+      var linkMs = d.mb.lnk;
+      if (linkMs < 2000) {
+        document.getElementById('mbLink').innerText = 'OK (' + linkMs + 'ms)';
+        document.getElementById('mbLink').className = 'val';
+      } else {
+        document.getElementById('mbLink').innerText = 'NO LINK (' + linkMs + 'ms)';
+        document.getElementById('mbLink').className = 'err-val';
+      }
+      
+      document.getElementById('lastRx').innerText = d.lrx || '—';
+      document.getElementById('lastTx').innerText = d.ltx || '—';
+      document.getElementById('lastCrcErr').innerText = d.crcE || '—';
+      
+      /* CRC error rate */
+      if (d.crcRate !== undefined) {
+        document.getElementById('mbCrc').innerText = d.mb.crc + ' (' + d.crcRate + '%)';
+      }
+      
+      /* CRC error history */
+      var histHtml = '';
+      if (d.crcH && d.crcH.length > 0) {
+        for (var i = 0; i < d.crcH.length; i++) {
+          var e = d.crcH[i];
+          histHtml += '<div style="margin:4px 0;padding:4px;border:1px solid #600;border-radius:4px;">';
+          histHtml += '<span style="color:#888;">' + e.t + 's ago</span> ';
+          histHtml += 'exp=<span style="color:#0f0;">0x' + e.ex + '</span> ';
+          histHtml += 'got=<span style="color:#f44;">0x' + e.rc + '</span> ';
+          histHtml += 'len=' + e.ln + '<br>';
+          histHtml += '<span style="color:#ff0;font-size:10px;">' + e.fr + '</span>';
+          histHtml += '</div>';
+        }
+      } else {
+        histHtml = '<span style="color:#080;">Нет ошибок CRC</span>';
+      }
+      document.getElementById('crcHistory').innerHTML = histHtml;
+      
+    }).catch(function(e) {});
+  }
+  
+  function setTarget() {
+    var v = document.getElementById('newTarget').value;
+    var val = parseInt(v);
+    if (isNaN(val) || val <= 0 || val > 360) {
+      document.getElementById('setStatus').innerText = 'ERROR: invalid value';
+      document.getElementById('setStatus').style.color = '#f44';
+      return;
+    }
+    document.getElementById('setStatus').style.color = '#0f0';
+    fetch('/set?v=' + val).then(function(r){return r.json();}).then(function(d) {
+      if (d.ok) {
+        document.getElementById('setStatus').innerText = 'OK! Set: ' + d.v + String.fromCharCode(176) + ' (pending PLC read)';
+      } else {
+        document.getElementById('setStatus').innerText = 'ERROR: ' + JSON.stringify(d);
+        document.getElementById('setStatus').style.color = '#f44';
+      }
+      setTimeout(function(){ document.getElementById('setStatus').innerText = ''; }, 5000);
+    }).catch(function(e) {
+      document.getElementById('setStatus').innerText = 'FETCH ERROR: ' + e;
+      document.getElementById('setStatus').style.color = '#f44';
+    });
+  }
+
+  function sendZero() {
+    document.getElementById('zeroStatus').style.color = '#ff0';
+    document.getElementById('zeroStatus').innerText = 'Отправка...';
+    fetch('/cmd?c=3').then(function(r){return r.json();}).then(function(d) {
+      if (d.ok) {
+        document.getElementById('zeroStatus').innerText = 'OK! Позиция обнулена';
+        document.getElementById('zeroStatus').style.color = '#0f0';
+      } else {
+        document.getElementById('zeroStatus').innerText = 'ERROR: ' + JSON.stringify(d);
+        document.getElementById('zeroStatus').style.color = '#f44';
+      }
+      setTimeout(function(){ document.getElementById('zeroStatus').innerText = ''; }, 3000);
+    }).catch(function(e) {
+      document.getElementById('zeroStatus').innerText = 'FETCH ERROR: ' + e;
+      document.getElementById('zeroStatus').style.color = '#f44';
+    });
+  }
+
+  setInterval(updateAngle, 150);
+  setInterval(updateData, 2000);
+  updateAngle();
+  updateData();
+</script>
+</body>
+</html>
+)=====";
+
+/* ===================== HTTP Handlers ===================== */
+
+void handleRoot() {
+  server.send(200, "text/html", INDEX_HTML);
+}
+
+String hexDump(uint8_t *buf, int len) {
+  String s = "";
+  for (int i = 0; i < len; i++) {
+    if (buf[i] < 0x10) s += "0";
+    s += String(buf[i], HEX);
+    if (i < len - 1) s += " ";
+  }
+  return s;
+}
+
+void handleDataRequest() {
+  unsigned long linkMs = millis() - lastModbusOkTime;
+  if (lastModbusOkTime == 0) linkMs = 99999;
+  
+  String json = "{\"r\":[";
+  for (int i = 0; i < 16; i++) {
+    json += String(holdingRegs[i]);
+    if (i < 15) json += ",";
+  }
+  json += "],\"mb\":{";
+  json += "\"rx\":" + String(mbFramesRx) + ",";
+  json += "\"tx\":" + String(mbFramesTx) + ",";
+  json += "\"rd\":" + String(mbReadCount) + ",";
+  json += "\"wr\":" + String(mbWriteCount) + ",";
+  json += "\"crc\":" + String(mbCrcErrors) + ",";
+  json += "\"adr\":" + String(mbAddrMismatch) + ",";
+  json += "\"fn\":" + String(mbFuncErrors) + ",";
+  json += "\"sh\":" + String(mbShortFrames) + ",";
+  json += "\"spl\":" + String(mbFramesSplit) + ",";
+  json += "\"byt\":" + String(mbBytesRx) + ",";
+  json += "\"lnk\":" + String(linkMs);
+  json += "},";
+  json += "\"lrx\":\"" + hexDump(lastRxFrame, lastRxFrameLen) + "\",";
+  json += "\"ltx\":\"" + hexDump(lastTxFrame, lastTxFrameLen) + "\",";
+  
+  if (mbCrcErrors > 0) {
+    String crcInfo = "expected=0x";
+    if (lastCrcExpected < 0x10) crcInfo += "0";
+    crcInfo += String(lastCrcExpected, HEX);
+    crcInfo += " received=0x";
+    if (lastCrcReceived < 0x10) crcInfo += "0";
+    crcInfo += String(lastCrcReceived, HEX);
+    json += "\"crcE\":\"" + crcInfo + "\"";
+  } else {
+    json += "\"crcE\":\"\"";
+  }
+  
+  /* CRC error rate */
+  if (mbTotalFrames > 0) {
+    float rate = (float)mbCrcErrors * 100.0 / (float)mbTotalFrames;
+    json += ",\"crcRate\":\"";
+    json += String(rate, 1);
+    json += "\"";
+  } else {
+    json += ",\"crcRate\":\"0\"";
+  }
+  
+  /* WebTarget diagnostic info */
+  json += ",\"wtp\":";
+  json += webTargetPending ? "1" : "0";
+  json += ",\"wts\":";
+  json += String(millis() - webTargetSetTime);
+  json += ",\"wtrc\":";
+  json += String(webTargetReadCount);
+  json += ",\"wtlv\":";
+  json += String(webTargetLastSentValue);
+
+  /* CRC error history */
+  json += ",\"crcH\":[";
+  int histEntries = crcHistCount < CRC_HIST_SIZE ? crcHistCount : CRC_HIST_SIZE;
+  for (int i = 0; i < histEntries; i++) {
+    /* Read from newest to oldest */
+    int idx = (crcHistIdx - 1 - i + CRC_HIST_SIZE) % CRC_HIST_SIZE;
+    CrcErrorEntry &e = crcHistory[idx];
+    unsigned long ago = (millis() - e.timestamp) / 1000;
+    if (i > 0) json += ",";
+    json += "{\"t\":" + String(ago);
+    json += ",\"ex\":\"";
+    if (e.crcExpected < 0x1000) json += "0";
+    if (e.crcExpected < 0x100) json += "0";
+    if (e.crcExpected < 0x10) json += "0";
+    json += String(e.crcExpected, HEX);
+    json += "\",\"rc\":\"";
+    if (e.crcReceived < 0x1000) json += "0";
+    if (e.crcReceived < 0x100) json += "0";
+    if (e.crcReceived < 0x10) json += "0";
+    json += String(e.crcReceived, HEX);
+    json += "\",\"ln\":" + String(e.frameLen);
+    json += ",\"fr\":\"" + hexDump(e.frameData, e.frameLen < 32 ? e.frameLen : 32) + "\"}";
+  }
+  json += "]";
+  
+  json += "}";
+  
+  server.send(200, "application/json", json);
+}
+
+void handleSet() {
+  if (!server.hasArg("v")) { server.send(400, "text/plain", "missing v"); return; }
+  String raw = server.arg("v");
+  int v = raw.toInt();
+  if (v <= 0 || v > 360) {
+    Serial.print("[WEB] REJECT: invalid value='");
+    Serial.print(raw);
+    Serial.println("'");
+    server.send(400, "text/plain", "invalid value: " + raw);
+    return;
+  }
+  holdingRegs[REG_WEB_TARGET] = (uint16_t)v;
+  webTargetSetTime = millis();
+  webTargetPending = true;
+  Serial.print("[WEB] Set WebTarget reg=10 value=");
+  Serial.print(v);
+  Serial.print(" holdingRegs[10]=");
+  Serial.println(holdingRegs[REG_WEB_TARGET]);
+  /* Return JSON with confirmation so JS can verify */
+  server.send(200, "application/json", "{\"ok\":1,\"v\":" + String(v) + "}");
+}
+
+/* Lightweight fast angle endpoint - minimal response for 50ms polling */
+void handleAngle() {
+  unsigned long linkMs = millis() - lastModbusOkTime;
+  if (lastModbusOkTime == 0) linkMs = 99999;
+  /* CSV: currentAngle,defaultTarget,targetAngle,cycle,mode,done,linkMs */
+  String resp = String(holdingRegs[REG_CURRENT_ANGLE]) + "," +
+                String(holdingRegs[REG_DEFAULT_TARGET]) + "," +
+                String(holdingRegs[REG_TARGET_ANGLE]) + "," +
+                String(holdingRegs[REG_CYCLE]) + "," +
+                String(holdingRegs[REG_MODE]) + "," +
+                String(holdingRegs[REG_DONE]) + "," +
+                String(linkMs);
+  server.send(200, "text/plain", resp);
+}
+
+/* Command endpoint - sends commands to PLC via reg 9 */
+void handleCmd() {
+  if (!server.hasArg("c")) { server.send(400, "text/plain", "missing c"); return; }
+  int cmd = server.arg("c").toInt();
+  if (cmd < 1 || cmd > 10) {
+    server.send(400, "application/json", "{\"ok\":0,\"err\":\"invalid cmd\"}");
+    return;
+  }
+  holdingRegs[REG_COMMAND] = (uint16_t)cmd;
+  lastCmdMillis = millis();
+  lastCmdValue = cmd;
+  Serial.print("[WEB] Command sent: ");
+  Serial.println(cmd);
+  server.send(200, "application/json", "{\"ok\":1,\"cmd\":" + String(cmd) + "}");
+}
+
+/* Calculate expected Modbus frame length from header bytes.
+   Returns 0 if cannot determine (unknown function). */
+int getExpectedFrameLen(uint8_t *buf, int available) {
+  if (available < 2) return 0;
+  uint8_t func = buf[1];
+  if (func == 0x03) {
+    /* Read Holding Registers request: addr(1)+func(1)+regH(1)+regL(1)+cntH(1)+cntL(1)+crcL(1)+crcH(1) = 8 */
+    return 8;
+  }
+  if (func == 0x10) {
+    /* Write Multiple Registers: addr(1)+func(1)+regH(1)+regL(1)+cntH(1)+cntL(1)+bytes(1)+data(N)+crcL(1)+crcH(1) */
+    if (available < 7) return 0;
+    return 9 + buf[6];
+  }
+  return 0; /* unknown function */
+}
+
+/* Try to process a single frame from buffer. Returns number of bytes consumed, or 0 if failed. */
+int tryProcessSingleFrame(uint8_t *buf, int len) {
+  if (len < 4) return 0;
+  
+  /* Try expected length first */
+  int expected = getExpectedFrameLen(buf, len);
+  if (expected > 0 && expected <= len) {
+    uint16_t crcFromFrame = buf[expected-2] | (buf[expected-1] << 8);
+    uint16_t calc = crc16(buf, expected - 2);
+    if (calc == crcFromFrame) {
+      mbFramesRx++;
+      mbTotalFrames++;
+      
+      /* Save for debug display */
+      lastRxFrameLen = expected < 64 ? expected : 64;
+      memcpy(lastRxFrame, buf, lastRxFrameLen);
+      
+      processModbusFrame(buf, expected);
+      return expected;
+    }
+  }
+  
+  /* Fallback: try entire buffer as one frame */
+  if (expected == 0 || expected > len) {
+    uint16_t crcFromFrame = buf[len-2] | (buf[len-1] << 8);
+    uint16_t calc = crc16(buf, len - 2);
+    if (calc == crcFromFrame) {
+      mbFramesRx++;
+      mbTotalFrames++;
+      lastRxFrameLen = len < 64 ? len : 64;
+      memcpy(lastRxFrame, buf, lastRxFrameLen);
+      processModbusFrame(buf, len);
+      return len;
+    }
+  }
+  
+  return 0; /* CRC failed */
+}
+
+void logCrcError(uint8_t *buf, int len) {
+  uint16_t crcFromFrame = buf[len-2] | (buf[len-1] << 8);
+  uint16_t calc = crc16(buf, len - 2);
+  
+  mbCrcErrors++;
+  mbTotalFrames++;
+  lastCrcExpected = calc;
+  lastCrcReceived = crcFromFrame;
+  
+  /* Save to CRC error history */
+  CrcErrorEntry &entry = crcHistory[crcHistIdx];
+  entry.timestamp = millis();
+  entry.crcExpected = calc;
+  entry.crcReceived = crcFromFrame;
+  entry.frameLen = len;
+  int copyLen = len < 32 ? len : 32;
+  memcpy(entry.frameData, buf, copyLen);
+  crcHistIdx = (crcHistIdx + 1) % CRC_HIST_SIZE;
+  crcHistCount++;
+  
+  Serial.print("[MB] CRC ERR #");
+  Serial.print(mbCrcErrors);
+  Serial.print(" rate=");
+  Serial.print((float)mbCrcErrors * 100.0 / (float)mbTotalFrames, 1);
+  Serial.print("% len=");
+  Serial.print(len);
+  Serial.print(" data=");
+  for (int i = 0; i < len && i < 24; i++) {
+    if (buf[i] < 0x10) Serial.print("0");
+    Serial.print(buf[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+/* ===================== Modbus Processing ===================== */
+
+void processModbusFrame(uint8_t *frame, int len) {
+  if (len < 4) {
+    mbShortFrames++;
+    return;
+  }
+  
+  uint8_t addr = frame[0];
+  if (addr != MODBUS_ADDR) {
+    mbAddrMismatch++;
+    Serial.print("[MB] Addr mismatch: got=");
+    Serial.print(addr);
+    Serial.print(" expected=");
+    Serial.println(MODBUS_ADDR);
+    return;
+  }
+  
+  uint8_t func = frame[1];
+  
+  if (func == 0x03 && len >= 8) {
+    /* Read Holding Registers */
+    uint16_t reg = (frame[2] << 8) | frame[3];
+    uint16_t count = (frame[4] << 8) | frame[5];
+    
+    Serial.print("[MB] RD reg=");
+    Serial.print(reg);
+    Serial.print(" cnt=");
+    Serial.println(count);
+    
+    if (reg + count <= 16) {
+      uint8_t resp[64];
+      int respIdx = 0;
+      resp[respIdx++] = MODBUS_ADDR;
+      resp[respIdx++] = 0x03;
+      resp[respIdx++] = count * 2;
+      
+      for (int i = 0; i < count; i++) {
+        uint16_t v = holdingRegs[reg + i];
+        resp[respIdx++] = (v >> 8) & 0xFF;
+        resp[respIdx++] = v & 0xFF;
+      }
+      
+      uint16_t c = crc16(resp, respIdx);
+      resp[respIdx++] = c & 0xFF;
+      resp[respIdx++] = (c >> 8) & 0xFF;
+      
+      sendResponse(resp, respIdx);
+      lastModbusOkTime = millis();
+      mbReadCount++;
+      
+      /* Track reg10 reads with non-zero value */
+      if (reg <= REG_WEB_TARGET && reg + count > REG_WEB_TARGET) {
+        uint16_t wtVal = holdingRegs[REG_WEB_TARGET];
+        if (wtVal != 0) {
+          webTargetReadCount++;
+          webTargetLastSentValue = wtVal;
+          Serial.print("[MB] PLC READ reg10=");
+          Serial.print(wtVal);
+          Serial.print(" readCount=");
+          Serial.println(webTargetReadCount);
+        }
+        /* Mark WebTarget as read by PLC - start clear countdown */
+        if (webTargetPending) {
+          webTargetPending = false;
+        }
+      }
+    }
+  }
+  else if (func == 0x10 && len >= 9) {
+    /* Write Multiple Registers */
+    uint16_t reg = (frame[2] << 8) | frame[3];
+    uint16_t count = (frame[4] << 8) | frame[5];
+    uint8_t byteCount = frame[6];
+    
+    Serial.print("[MB] WR reg=");
+    Serial.print(reg);
+    Serial.print(" cnt=");
+    Serial.print(count);
+    Serial.print(" bytes=");
+    Serial.println(byteCount);
+    
+    if (reg + count <= 16 && byteCount == count * 2) {
+      for (int i = 0; i < count; i++) {
+        uint16_t v = (frame[7 + i*2] << 8) | frame[8 + i*2];
+        int r = reg + i;
+        /* Protect ESP->PLC registers from being overwritten by PLC writes */
+        if (r == REG_COMMAND || r == REG_WEB_TARGET) {
+          Serial.print("[MB] PROTECT: skip write to reg ");
+          Serial.print(r);
+          Serial.print(" val=");
+          Serial.println(v);
+          continue;
+        }
+        holdingRegs[r] = v;
+      }
+      
+      /* Log written values */
+      Serial.print("[MB] Written: ");
+      for (int i = 0; i < count; i++) {
+        Serial.print("r");
+        Serial.print(reg + i);
+        Serial.print("=");
+        Serial.print(holdingRegs[reg + i]);
+        if (i < count - 1) Serial.print(" ");
+      }
+      Serial.println();
+      
+      /* Response: echo addr, func, start reg, count */
+      uint8_t resp[8];
+      resp[0] = MODBUS_ADDR;
+      resp[1] = 0x10;
+      resp[2] = frame[2]; resp[3] = frame[3];
+      resp[4] = frame[4]; resp[5] = frame[5];
+      
+      uint16_t c = crc16(resp, 6);
+      resp[6] = c & 0xFF;
+      resp[7] = (c >> 8) & 0xFF;
+      
+      sendResponse(resp, 8);
+      lastModbusOkTime = millis();
+      mbWriteCount++;
+    }
+  }
+  else {
+    mbFuncErrors++;
+    Serial.print("[MB] Unknown func=0x");
+    Serial.println(func, HEX);
+  }
+}
+
+/* ===================== Setup ===================== */
+
+void setup() {
+  /* Set CPU to 160MHz for maximum performance */
+  system_update_cpu_freq(160);
+  
+  pinMode(RS485_DE_PIN, OUTPUT);
+  rs485TxEnable(false);
+  rs485.begin(MODBUS_BAUD);
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("=== ESP8266 Trubogib Debug v2.3 ===");
+  Serial.print("CPU: ");
+  Serial.print(ESP.getCpuFreqMHz());
+  Serial.println("MHz");
+  Serial.println("Modbus slave addr=1, 9600 8N1, INT angles");
+
+  for (int i = 0; i < 16; i++) holdingRegs[i] = 0;
+  memset(crcHistory, 0, sizeof(crcHistory));
+
+  WiFi.softAP("Trubogib", "12345678");
+  Serial.print("SoftAP: Trubogib  IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/data", handleDataRequest);
+  server.on("/set", handleSet);
+  server.on("/a", handleAngle);
+  server.on("/cmd", handleCmd);
+  server.begin();
+  Serial.println("Web server started on port 80");
+  Serial.println("Endpoints: / /data /set /a /cmd");
+}
+
+/* ===================== Main Loop ===================== */
+
+void loop() {
+  /* RS485 Modbus FIRST - read all available bytes before anything else.
+     This prevents HTTP response generation from causing SoftwareSerial overruns */
+  static uint8_t buf[256];
+  static int idx = 0;
+  static unsigned long lastRxTime = 0;
+  
+  while (rs485.available() && idx < 255) {
+    buf[idx++] = rs485.read();
+    lastRxTime = micros();
+    mbBytesRx++;
+  }
+  
+  /* Frame timeout: gap > 5ms = end of Modbus RTU frame at 9600 baud
+     (theoretical 3.5 char = 4ms, increased for SoftwareSerial jitter) */
+  if (idx > 0 && (micros() - lastRxTime > 5000)) {
+    
+    if (idx >= 4) {
+      /* Frame-length-aware processing - handles concatenated frames */
+      int offset = 0;
+      int framesProcessed = 0;
+      
+      while (offset < idx - 3) {
+        int remaining = idx - offset;
+        int consumed = tryProcessSingleFrame(buf + offset, remaining);
+        if (consumed > 0) {
+          offset += consumed;
+          framesProcessed++;
+          delayMicroseconds(100);
+        } else {
+          break;
+        }
+      }
+      
+      if (framesProcessed == 0) {
+        /* No valid frames found - log as CRC error */
+        lastRxFrameLen = idx < 64 ? idx : 64;
+        memcpy(lastRxFrame, buf, lastRxFrameLen);
+        logCrcError(buf, idx);
+      } else if (framesProcessed > 1) {
+        mbFramesSplit += framesProcessed;
+        Serial.print("[MB] Split ");
+        Serial.print(framesProcessed);
+        Serial.println(" concatenated frames");
+      }
+      
+      if (framesProcessed > 0 && offset < idx) {
+        /* Leftover bytes = partial next frame, keep in buffer */
+        int leftover = idx - offset;
+        memmove(buf, buf + offset, leftover);
+        idx = leftover;
+        lastRxTime = micros();
+      } else {
+        idx = 0;
+      }
+    } else {
+      mbShortFrames++;
+      Serial.print("[MB] Short frame len=");
+      Serial.println(idx);
+      idx = 0;
+    }
+  }
+  
+  /* Safety timeout for buffer clearing (50ms) */
+  if (idx > 0 && (micros() - lastRxTime > 50000)) {
+    Serial.print("[MB] Buffer timeout, flushing ");
+    Serial.print(idx);
+    Serial.println(" bytes");
+    idx = 0;
+  }
+
+  /* Handle HTTP after Modbus is fully processed */
+  server.handleClient();
+
+  /* Auto-clear WebTarget 2000ms after it was set from web UI.
+     This gives PLC ~20 poll cycles (100ms each) to read the value.
+     After clearing, PLC sees 0 and resets prev_mb_in_WebTarget. */
+  if (holdingRegs[REG_WEB_TARGET] != 0 && !webTargetPending && 
+      millis() - webTargetSetTime > 2000UL) {
+    Serial.println("[WEB] Auto-clear WebTarget after 2000ms");
+    holdingRegs[REG_WEB_TARGET] = 0;
+  }
+
+  /* Auto-reset command register after 1 second */
+  if (lastCmdValue != 0 && millis() - lastCmdMillis > 1000UL) {
+    holdingRegs[REG_COMMAND] = 0;
+    lastCmdValue = 0;
+  }
+}
+

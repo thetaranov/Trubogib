@@ -1,0 +1,88 @@
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @GLOBAL_VARIABLE_LIST := 'Global_Variables' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+(* @SYMFILEFLAGS := '2048' *)
+VAR_GLOBAL
+    (* Fast discrete inputs (encoder) *)
+    gEncoderA   AT %IX0.0 : BOOL;    (* DI1 - Encoder A (fast input) *)
+    gEncoderB   AT %IX0.1 : BOOL;    (* DI2 - Encoder B (fast input) *)
+
+    (* ModBus (Master) system/channel variables exposed by device configuration *)
+    gModbus_Master_Channel AT %QD6.0 : DWORD; (* ModBus Master: channel/last address (Q area) *)
+    gModbus_Master_LastError AT %QW6.1 : WORD; (* ModBus Master: last error code (Q area) *)
+
+    (* Discrete inputs (DI3..DI18) mapped to %IX1.0.0 - %IX1.1.7 *)
+    gDI_3  AT %IX1.0.0 : BOOL; (* DI3 *)
+    gDI_4  AT %IX1.0.1 : BOOL; (* DI4 *)
+    gDI_5  AT %IX1.0.2 : BOOL; (* DI5 *)
+    gDI_6  AT %IX1.0.3 : BOOL; (* DI6 *)
+    gDI_7  AT %IX1.0.4 : BOOL; (* DI7 *)
+    gDI_8  AT %IX1.0.5 : BOOL; (* DI8 *)
+    gDI_9  AT %IX1.0.6 : BOOL; (* DI9 *)
+    gDI_10 AT %IX1.0.7 : BOOL; (* DI10 *)
+    gDI_11 AT %IX1.1.0 : BOOL; (* DI11 *)
+    gDI_12 AT %IX1.1.1 : BOOL; (* DI12 *)
+    gDI_13 AT %IX1.1.2 : BOOL; (* DI13 *)
+    gDI_14 AT %IX1.1.3 : BOOL; (* DI14 *)
+    gDI_15 AT %IX1.1.4 : BOOL; (* DI15 *)
+    gDI_16 AT %IX1.1.5 : BOOL; (* DI16 *)
+    gDI_17 AT %IX1.1.6 : BOOL; (* DI17 *)
+    gDI_18 AT %IX1.1.7 : BOOL; (* DI18 *)
+
+    (* Discrete outputs - relay DO1..DO8 mapped to %QX3.0.0..%QX3.0.7 *)
+    gDO_1 AT %QX3.0.0 : BOOL;  (* DO1 - Forward *)
+    gDO_2 AT %QX3.0.1 : BOOL;  (* DO2 - Reverse *)
+    gDO_3 AT %QX3.0.2 : BOOL;  (* DO3 - In position indicator *)
+    gDO_4 AT %QX3.0.3 : BOOL;  (* DO4 *)
+    gDO_5 AT %QX3.0.4 : BOOL;  (* DO5 *)
+    gDO_6 AT %QX3.0.5 : BOOL;  (* DO6 *)
+    gDO_7 AT %QX3.0.6 : BOOL;  (* DO7 *)
+    gDO_8 AT %QX3.0.7 : BOOL;  (* DO8 *)
+
+    (* Fast/transistor discrete outputs DO9..DO12 mapped to %QX2.0..%QX2.3 (fast outputs module) *)
+    gDO_9  AT %QX2.0 : BOOL; (* DO9  - fast/transistor output *)
+    gDO_10 AT %QX2.1 : BOOL; (* DO10 *)
+    gDO_11 AT %QX2.2 : BOOL; (* DO11 *)
+    gDO_12 AT %QX2.3 : BOOL; (* DO12 *)
+
+    (* Variables for Modbus and internal state (no AT) *)
+    (*
+        Modbus (holding) register map served by ESP (slave):
+        Register numbers (offset 0):
+        0-1   : target angle (REAL)            (REG_TARGET_ANGLE_HI/LO)
+        2-3   : current angle (REAL)           (REG_CURRENT_ANGLE_HI/LO)
+        4-5   : reserved
+        6     : status (WORD)                  (0=Stop,1=Moving,2=In position)
+        7     : error code (WORD)
+        8     : command (WORD)                 (1=Start,2=Stop,3=Calib)
+        9-10  : encoder count (DINT, hi/lo)
+        11    : PPR (WORD)
+        12    : quad mode (WORD)
+        13    : max time (WORD)
+        14-15 : hysteresis (REAL)
+    *)
+    gTargetAngle : REAL := 45.0;    (* target angle, degrees *)
+    gCurrentAngle : REAL := 0.0;    (* current angle, degrees *)
+    gAngleFromStart : REAL := 0.0;  (* angle from program start *)
+    gStatus : INT := 0;             (* 0=Stop,1=Moving,2=In position *)
+    gErrorCode : INT := 0;          (* 0=OK,1=Timeout,2=Fault *)
+    gCommand : INT := 0;            (* 1=Start,2=Stop,3=Calibrate *)
+    gEncoderCount : DINT := 0;     (* encoder counter for Modbus *)
+
+    (* Calibration / Modbus helper variables *)
+    gStartCalib : BOOL := FALSE;
+    gCalibRunning : BOOL := FALSE;
+    gCalibStatus : INT := 0;
+    gCalibRevsDone : INT := 0;
+    gCalibRevsTarget : INT := 3;
+    gCalibMeasured : REAL := 0.0;
+    gCalibCountsPerRev : DINT := 0;
+END_VAR
+(* @OBJECT_END := 'Global_Variables' *)
+(* @CONNECTIONS := Global_Variables
+FILENAME : ''
+FILETIME : 0
+EXPORT : 0
+NUMOFCONNECTIONS : 0
+*)

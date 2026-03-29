@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>06. ПО и запуск — Трубогиб ЧПУ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <strong>ТРУБОГИБ ЧПУ</strong>
+      <span>Мануал v2.1</span>
+    </div>
+    <div class="sidebar-section">Навигация</div>
+    <a href="index.html">&#127968; Главная</a>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Разделы</div>
+    <a href="01_vfd_delta_cp2000.html">01. Привод VFD (Delta CP2000)</a>
+    <a href="02_plc_owen.html">02. ПЛК Owen + Энкодер</a>
+    <a href="03_servo_mitsubishi.html">03. Сервоприводы Mitsubishi</a>
+    <a href="04_control_bridge.html">04. Интеграционный слой</a>
+    <a href="05_mechanics.html">05. Кинематика осей</a>
+    <a href="06_software_runtime.html" class="active">06. ПО и запуск</a>
+  </nav>
+
+  <div class="main-content">
+    <header>
+      <div class="container">
+        <h1>06. ПО TubeBender v2.1 — Запуск и Dry Run</h1>
+        <div class="subtitle">EXE на C++/OCCT/ImGui. Режимы: Dry Run, реальный цикл. Синхронизация EXE &harr; Teensy &harr; ПЛК.</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <nav class="breadcrumb">
+        <a href="index.html">Главная</a> <span>&rsaquo;</span> 06. ПО и запуск
+      </nav>
+
+      <h2>1. Обзор EXE TubeBender v2.1</h2>
+
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Язык / стек</td><td>C++17, OpenCASCADE 7.9+, Dear ImGui Docking, OpenGL 3.3 Core</td></tr>
+        <tr><td>Расположение исходников</td><td class="mono">v2.1 (C++ OCCT)/src/</td></tr>
+        <tr><td>Запуск</td><td class="mono">v2.1 (C++ OCCT)/build/Release/TubeBender.exe</td></tr>
+        <tr><td>Сборка</td><td>vcpkg + CMake (см. docs/тз_v2.0.md)</td></tr>
+        <tr><td>Рендеринг</td><td>FBO off-screen → ImGui::Image() (3D в ImGui окне)</td></tr>
+        <tr><td>Координаты</td><td>Point0 = (−76, 0, 347) мм. Подача: −Y. Z: вверх. +X: вправо.</td></tr>
+      </table>
+      </div>
+
+      <h2>2. Управляющая программа (шаги гибки)</h2>
+
+      <h3>2.1. Формат шага</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Поле</th><th>Ед.</th><th>Описание</th></tr>
+        <tr class="key-row"><td class="mono bold">L_feed</td><td>мм</td><td><strong>Подача каретки (ось Z)</strong></td></tr>
+        <tr class="key-row"><td class="mono bold">Rotation</td><td>°</td><td><strong>Вращение патрона (ось C)</strong></td></tr>
+        <tr class="key-row"><td class="mono bold">Angle</td><td>°</td><td><strong>Угол гибки (0–180°)</strong></td></tr>
+      </table>
+      </div>
+
+      <h3>2.2. Глобальные параметры программы</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Описание</th></tr>
+        <tr><td class="mono bold">D</td><td>Наружный диаметр трубы (мм), единый для всей программы</td></tr>
+        <tr><td class="mono bold">R</td><td>Радиус гиба по средней линии CLR (мм), единый</td></tr>
+        <tr><td class="mono bold">ClampLength</td><td>Длина зажима ролика (мм). По умолч. 60 мм.</td></tr>
+      </table>
+      </div>
+
+      <h3>2.3. Тестовая программа (Smoke Test)</h3>
+      <pre><code>D = 38 мм, R = 76 мм, ClampLength = 60 мм
+
+Шаг 1: L_feed=100, Rotation=0°,  Angle=90°
+Шаг 2: L_feed=200, Rotation=0°,  Angle=0°
+
+Ожидаемый результат:
+  Шаг 1: полный 7-фазный цикл гибки (анимация 90°)
+  Шаг 2: пропуск гибочных фаз (Angle=0 → только подача)
+  L_total ≈ 100 + π×76×90/180 + 200 = 419.38 мм</code></pre>
+
+      <h2>3. 7-фазный цикл гибки (один шаг)</h2>
+
+      <div class="table-wrap">
+      <table>
+        <tr><th>#</th><th>Фаза</th><th>Ось/устройство</th><th>Скорость</th><th>Условие пропуска</th></tr>
+        <tr class="key-row">
+          <td>1</td><td><strong>Feed</strong></td>
+          <td>Ось Z (Dry Run / Teensy)</td><td>300 мм/с</td><td>—</td>
+        </tr>
+        <tr class="key-row">
+          <td>2</td><td><strong>Rotation</strong></td>
+          <td>Ось C (Dry Run / Teensy)</td><td>120°/с</td><td>Rotation = 0</td>
+        </tr>
+        <tr>
+          <td>3</td><td>ClampClose</td>
+          <td>ПЛК → реле → механика зажима</td><td>600 мм/с</td><td>Angle = 0</td>
+        </tr>
+        <tr class="key-row">
+          <td>4</td><td><strong>Bend</strong></td>
+          <td>ПЛК → DO10 → VFD Delta CP2000</td><td>60°/с</td><td>Angle = 0</td>
+        </tr>
+        <tr>
+          <td>5</td><td>ClampOpen</td>
+          <td>ПЛК → реле → механика зажима</td><td>600 мм/с</td><td>Angle = 0</td>
+        </tr>
+        <tr>
+          <td>6</td><td>TubePush</td>
+          <td>Ось Z (+ClampLength)</td><td>300 мм/с</td><td>Angle = 0</td>
+        </tr>
+        <tr>
+          <td>7</td><td>BenderReturn</td>
+          <td>ПЛК → DO11 → VFD → ролик в 0°</td><td>120°/с</td><td>Angle = 0</td>
+        </tr>
+      </table>
+      </div>
+
+      <div class="alert alert-info">
+        <strong>Если Angle = 0:</strong> фазы 3–7 пропускаются. Выполняются только Feed и Rotation.
+      </div>
+
+      <h2>4. Панель &laquo;Станок&raquo; (Machine Runtime)</h2>
+
+      <h3>4.1. Кнопки управления</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Кнопка</th><th>Действие</th><th>USB-Serial команда</th></tr>
+        <tr class="key-row">
+          <td><strong>Подключить</strong></td>
+          <td>Подключиться к Teensy 4.1 по USB-Serial (выбор COM-порта)</td>
+          <td class="mono">Открытие COM-порта (115200 8N1)</td>
+        </tr>
+        <tr>
+          <td>Servo ON / OFF</td>
+          <td>Включить/выключить сервоприводы (через Modbus CMD 6/7 &rarr; ПЛК DO7/DO8)</td>
+          <td class="mono">SON 1 / SON 0</td>
+        </tr>
+        <tr>
+          <td>Home Z / Home C</td>
+          <td>Выполнить Home-процедуру осей Z/C</td>
+          <td class="mono">HZ / HC</td>
+        </tr>
+        <tr>
+          <td>Обнулить энкодер</td>
+          <td>Сбросить текущий угол гибки (CMD 3 &rarr; Modbus &rarr; ПЛК)</td>
+          <td class="mono">CMD 3</td>
+        </tr>
+        <tr class="key-row">
+          <td><strong>ЗАПУСК</strong></td>
+          <td><strong>Запуск реального цикла гибки по программе</strong></td>
+          <td class="mono">SON 1, MZ, MC, TGT, CMD 4</td>
+        </tr>
+        <tr>
+          <td>СТОП</td>
+          <td>Плановая остановка программы</td>
+          <td class="mono">STOP</td>
+        </tr>
+        <tr class="key-row">
+          <td><strong>E-STOP</strong></td>
+          <td><strong>Немедленная аварийная остановка!</strong></td>
+          <td class="mono">ESTOP</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>4.2. Фазы выполнения программы (MachPhase)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Фаза</th><th>Описание</th></tr>
+        <tr><td class="mono bold">Idle</td><td>Ожидание. Готова к приёму команды.</td></tr>
+        <tr><td class="mono bold">ServoOn</td><td>Ожидание включения серво (SON 1 &rarr; Teensy &rarr; Modbus CMD 6 &rarr; ПЛК DO7/DO8 &rarr; +24В на CN1 pin 15). Верификация в EXE: фактические биты PLC DO7/DO8.</td></tr>
+        <tr><td class="mono bold">HomingZ / HomingC</td><td>Поиск Home по осям Z и C.</td></tr>
+        <tr><td class="mono bold">Feed</td><td>Подача каретки: MZ mm,speed &rarr; Step/Dir RS-422 &rarr; серво Z.</td></tr>
+        <tr><td class="mono bold">Rotation</td><td>Вращение патрона: MC deg,speed &rarr; Step/Dir RS-422 &rarr; серво C.</td></tr>
+        <tr><td class="mono bold">BendStart / BendWait</td><td>Гибка: TGT angle + CMD 4 &rarr; Modbus &rarr; ПЛК &rarr; VFD.</td></tr>
+        <tr><td class="mono bold">Clearance</td><td>Отвод каретки на ClampLength мм (освобождение ролика).</td></tr>
+        <tr><td class="mono bold">ReturnBend</td><td>Возврат ролика в 0&deg;: CMD 4 (цикл 2) &rarr; ПЛК &rarr; VFD.</td></tr>
+        <tr><td class="mono bold">StepDone</td><td>Шаг завершён. Переход к следующему.</td></tr>
+        <tr><td class="mono bold">ProgramDone</td><td>Все шаги выполнены.</td></tr>
+        <tr><td class="mono bold">Error</td><td>Ошибка оси / watchdog / связь / <strong>аларм серво (ALM D17/D18)</strong>.</td></tr>
+      </table>
+      </div>
+
+      <h2>4.3. Панель &laquo;Подключение&raquo; (Connection Debug)</h2>
+      <div class="alert alert-info">
+        <strong>Новое окно (v2.1):</strong> Меню &laquo;Окна&raquo; &rarr; &laquo;Подключение&raquo;. Отображает состояние всей цепочки связи в реальном времени.
+      </div>
+      <p>Окно &laquo;Подключение&raquo; показывает статус каждого звена:</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>#</th><th>Звено</th><th>Интерфейс</th><th>Индикация</th></tr>
+        <tr><td>1</td><td>PC (EXE) &harr; Teensy 4.1</td><td>USB-Serial 115200 8N1</td><td>COM-порт, версия прошивки</td></tr>
+        <tr><td>2</td><td>Teensy &harr; ПЛК Owen PLC110</td><td>Modbus RTU RS-485, 115200 8N1</td><td>Link (мс), RX/TX/ERR счётчики, данные гибки</td></tr>
+        <tr><td>3</td><td>Teensy &rarr; Серво Z (MR-JE-200A)</td><td>Step/Dir RS-422 (MAX490)</td><td>SON, позиция (мм), статус</td></tr>
+        <tr><td>4</td><td>Teensy &rarr; Серво C (MR-JE-200A)</td><td>Step/Dir RS-422 (MAX490)</td><td>SON, позиция (&deg;), статус</td></tr>
+        <tr><td>5</td><td>ПЛК &rarr; VFD Delta CP2000</td><td>DO10/DO11 реле</td><td>Статус ПЛК</td></tr>
+        <tr><td>6</td><td>ПЛК &rarr; SON серво</td><td>DO7/DO8 реле &rarr; CN1 pin 15</td><td>SON Z (+24В), SON C (+24В)</td></tr>
+        <tr class="key-row"><td><strong>7</strong></td><td><strong>Серво ALM &rarr; ПЛК</strong></td><td><strong>CN1 pin 37 (b-contact) &rarr; D17/D18</strong></td><td><strong>almZ, almC (красный = авария)</strong></td></tr>
+      </table>
+      </div>
+      <p>Цветовая индикация: <span style="color:#3a3"><strong>зелёный</strong></span> = OK, <span style="color:#a73"><strong>жёлтый</strong></span> = предупреждение, <span style="color:#a22"><strong>красный</strong></span> = ошибка/нет связи, <span style="color:#888"><strong>серый</strong></span> = нет данных.</p>
+      <p>Внизу окна &mdash; сводка готовности системы с подсказками по устранению проблем.</p>
+
+      <h2>5. Протокол синхронизации EXE &harr; Teensy &harr; ПЛК</h2>
+
+      <pre><code>EXE общается с Teensy через USB-Serial (115200, ASCII-команды + JSON-ответы).
+
+Команды EXE &rarr; Teensy (текст, завершаются \n):
+  ?             &mdash; запросить JSON-статус
+  SON 1 / SON 0 &mdash; включить/выключить серво (CMD 6/7 &rarr; Modbus &rarr; ПЛК DO7/DO8)
+  HZ / HC       &mdash; Home ось Z / C
+  MZ mm,spd     &mdash; движение оси Z (мм, мм/с)
+  MC deg,spd    &mdash; движение оси C (&deg;, &deg;/с)
+  TGT angle     &mdash; задать целевой угол гибки
+  CMD 4         &mdash; запустить цикл гибки (авто)
+  CMD 2         &mdash; стоп цикла
+  CMD 3         &mdash; обнулить угол энкодера
+  STOP          &mdash; остановить программу
+  ESTOP         &mdash; аварийная остановка
+
+Ответ Teensy &rarr; EXE (JSON, каждые 50 мс по команде '?'):
+  {"v":"2.1","mb":{"rx":N,"tx":N,"err":N,"link":N},
+   "z":{"mm":0.00,"st":0,"son":1},
+   "c":{"deg":0.00,"st":0,"son":1},
+   "bend":{"cur":0,"tgt":90,"cyc":1,"mode":1,"done":0},
+   "ext":{"do7":1,"do8":1},
+   "alm":{"z":0,"c":0},
+   "wd":0}
+
+Цикл выполнения шага:
+  1. EXE: SON 1 &rarr; ждёт фактические PLC do7=1 и do8=1
+  2. EXE: MZ feed_mm,100 &rarr; Teensy генерирует Step/Dir &rarr; серво Z
+  3. EXE: MC rotation_deg,30 &rarr; Teensy генерирует Step/Dir &rarr; серво C
+  4. EXE: TGT angle + CMD 4 &rarr; Teensy пишет Modbus рег.9-10 &rarr; ПЛК &rarr; VFD
+  5. EXE опрашивает статус (?) каждые 50 мс, ждёт bendDone=1
+  6. EXE: MZ +clampLength &rarr; отвод каретки
+  7. EXE: CMD 4 &rarr; возврат ролика (цикл 2), ждёт bendDone=1, cyc=1
+  8. EXE: MZ -clampLength &rarr; возврат каретки
+  9. Переход к следующему шагу</code></pre>
+
+      <h2>6. Режим Dry Run — тестирование без Teensy</h2>
+
+      <div class="alert alert-info">
+        <strong>Dry Run позволяет проверить всю анимацию и логику EXE без подключённого оборудования.</strong>
+        Оси Z и C выполняются виртуально. Ось гибки (ПЛК) — также симулируется.
+      </div>
+
+      <h3>Как запустить Dry Run:</h3>
+      <div class="steps">
+        <ol>
+          <li>Запустить <code>TubeBender.exe</code>. В редакторе загрузить или создать программу гибки.</li>
+          <li>Панель «Станок» → кнопка <strong>Dry Run</strong> (не требует подключения к оборудованию).</li>
+          <li>Наблюдать: 3D-анимация показывает полный цикл гибки со всеми 7 фазами.</li>
+          <li>Проверить: нет коллизий (труба не пересекает станину/оснастку), углы корректны, L_total верная.</li>
+          <li>Если всё нормально — можно переходить к реальному запуску (кнопка <strong>Start</strong>).</li>
+        </ol>
+      </div>
+
+      <h3>Dry Run vs реальный запуск:</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Dry Run</th><th>Реальный запуск (Start)</th></tr>
+        <tr><td>Ось Z (подача)</td><td>Виртуально (анимация EXE)</td><td>Teensy &rarr; Step/Dir &rarr; серво Z (реальное движение)</td></tr>
+        <tr><td>Ось C (вращение)</td><td>Виртуально (анимация EXE)</td><td>Teensy &rarr; Step/Dir &rarr; серво C (реальное движение)</td></tr>
+        <tr><td>Ось гибки</td><td>Виртуально</td><td><strong>Teensy &rarr; Modbus &rarr; ПЛК &rarr; VFD &rarr; мотор</strong></td></tr>
+        <tr><td>Нужен Teensy?</td><td>Нет</td><td>Да (USB-Serial)</td></tr>
+        <tr><td>Нужен ПЛК?</td><td>Нет</td><td>Да (Modbus RS-485)</td></tr>
+      </table>
+      </div>
+
+      <h2>7. Полная последовательность запуска комплекса</h2>
+
+      <h3>Шаг 1 — Подготовка железа</h3>
+      <div class="steps">
+        <ol>
+          <li>Убедиться, что E-Stop нажата (разомкнута). Осмотреть станок.</li>
+          <li>Включить автомат 380В (питание VFD и сервоусилителей). Подождать 10 сек (заряд конденсаторов).</li>
+          <li>Включить автомат 24В (питание ПЛК и дискретных цепей).</li>
+          <li>Разблокировать E-Stop. Убедиться: дисплей серводрайверов показывает <code>d09</code>.</li>
+          <li>Убедиться: ПЛК работает (индикатор RUN горит зелёным).</li>
+        </ol>
+      </div>
+
+      <h3>Шаг 2 — Подключение Teensy 4.1</h3>
+      <div class="alert alert-info">
+        <strong>WiFi (ESP8266) больше не используется.</strong> ESP8266 применялся только для отладки по HTTP. Вся связь теперь через USB-Serial + Modbus RTU.
+      </div>
+      <div class="steps">
+        <ol>
+          <li>Подключить Teensy 4.1 к ПК по USB-кабелю.</li>
+          <li>Убедиться: связь по Modbus RTU с ПЛК установлена (Serial1, 115200 8N1).</li>
+          <li>Убедиться: EXE видит Teensy через USB-Serial (COM-порт определяется автоматически).</li>
+        </ol>
+      </div>
+
+      <h3>Шаг 3 — Запуск EXE</h3>
+      <div class="steps">
+        <ol>
+          <li>Запустить <code>v2.1 (C++ OCCT)/build/Release/TubeBender.exe</code>.</li>
+          <li>Меню &laquo;Окна&raquo; &rarr; &laquo;Станок&raquo;. Выбрать COM-порт Teensy, нажать &laquo;Подключить&raquo;.</li>
+          <li>Меню &laquo;Окна&raquo; &rarr; &laquo;Подключение&raquo;. Убедиться: все 4 узла зелёные (PC&harr;Teensy, Teensy&harr;ПЛК, Серво Z, Серво C).</li>
+          <li>Нажать &laquo;Servo ON&raquo;. Убедиться: SON Z и SON C = ON (ПЛК DO7/DO8 замкнуты, +24В на CN1 pin 15).</li>
+        </ol>
+      </div>
+
+      <h3>Шаг 3.1 — Если Teensy постоянно отваливается по USB</h3>
+      <div class="alert alert-danger">
+        <strong>Быстрый чек-лист:</strong>
+        <ul>
+          <li>Общий 0В: Teensy GND, MAX485/MAX490 GND и 0В БП управления должны иметь общий reference.</li>
+          <li>PE не использовать как сигнальный «минус».</li>
+          <li>USB-кабель короткий, экранированный, желательно с ферритом.</li>
+          <li>Разнести силовые кабели VFD/серво и USB/RS-485 по трассам.</li>
+          <li>На входы Teensy нельзя подавать >3.3В (по спецификации PJRC для Teensy 4.1 — 3.3V only).</li>
+        </ul>
+      </div>
+
+      <h3>Шаг 4 — Dry Run (обязательная проверка перед реальным запуском)</h3>
+      <div class="steps">
+        <ol>
+          <li>Загрузить тестовую программу: Шаг1 (L=100, A=90°), Шаг2 (L=200, A=0°).</li>
+          <li>Кнопка <strong>Проверка коллизий</strong>. Убедиться в отсутствии пересечений.</li>
+          <li>Кнопка <strong>Dry Run</strong>. Наблюдать полную анимацию. Убедиться в корректности.</li>
+        </ol>
+      </div>
+
+      <h3>Шаг 5 — Реальный запуск</h3>
+      <div class="steps">
+        <ol>
+          <li>Убедиться: ПЛК в состоянии <code>READY</code> (HR[2]=0 в Modbus).</li>
+          <li>Труба зажата в патроне. Гибочная оснастка установлена.</li>
+          <li>Кнопка <strong>Start</strong> в панели «Станок» EXE.</li>
+          <li>Наблюдать: 3D-анимация EXE синхронна с реальным движением оси гибки.</li>
+          <li>Проверить лог: <code>logs/session_YYYYMMDD_HHMMSS.txt</code> — ошибок нет.</li>
+        </ol>
+      </div>
+
+      <h3>Шаг 6 — Проверка аварийных сценариев (обязательно при первом запуске)</h3>
+      <div class="steps">
+        <ol>
+          <li>Нажать <strong>E-STOP</strong> в EXE во время цикла &rarr; система должна остановиться немедленно (ESTOP &rarr; Teensy &rarr; Modbus CMD 10 &rarr; ПЛК).</li>
+          <li>Отключить USB-кабель &rarr; Modbus watchdog Teensy (2 сек) должен снять Servo-ON и прекратить Step/Dir.</li>
+          <li>Проверить окно &laquo;Подключение&raquo;: при потере связи соответствующие узлы становятся красными.</li>
+          <li>Имитировать аларм серво (например, снять питание 380В при включённом SON) &rarr; EXE должен показать <strong>&laquo;АЛАРМ серво Z/C! (D17/D18)&raquo;</strong> красным, программа должна перейти в Error.</li>
+        </ol>
+      </div>
+
+      <h2>8. Диагностика и лог событий</h2>
+
+      <div class="table-wrap">
+      <table>
+        <tr><th>Источник</th><th>Содержимое</th></tr>
+        <tr><td>Окно &laquo;Подключение&raquo;</td><td>Реалтайм-статус всех звеньев: PC&harr;Teensy, Modbus, Серво Z/C, SON, VFD</td></tr>
+        <tr><td>Окно &laquo;Станок&raquo; &rarr; Лог</td><td>Лог команд и ответов USB-Serial (до 500 записей)</td></tr>
+        <tr><td class="mono">? (USB-Serial)</td><td>JSON-статус Teensy: позиции осей, Modbus link, данные гибки</td></tr>
+        <tr><td class="mono">REGS (USB-Serial)</td><td>Дамп всех Modbus-регистров Teensy</td></tr>
+        <tr><td>Дисплей серводрайвера</td><td><code>d09</code> = норма, <code>AL.xx</code> = авария (см. раздел 03)</td></tr>
+        <tr><td>Индикаторы ПЛК</td><td>RUN (зел.), ERR (кр.), Modbus TX/RX мигают при обмене</td></tr>
+      </table>
+      </div>
+
+      <h2>9. Обработка алармов серво (ALM D17/D18)</h2>
+
+      <p>Серводрайверы MR-JE-200A сообщают о неисправности через выход ALM (CN1 pin 37, бело-голубой провод). Выход настроен как <strong>b-contact (NC)</strong>: в норме транзистор включён (DI = TRUE), при аварии &mdash; выключен (DI = FALSE).</p>
+
+      <h3>9.1. Цепочка прохождения аларма</h3>
+      <pre><code>MR-JE-200A ALM (CN1 pin 37, b-contact NC, бело-голубой провод)
+  &rarr; ПЛК D17 (%IX1.1.6) = Серво Z ALM / D18 (%IX1.1.7) = Серво C ALM
+  &rarr; ПЛК: almZ := NOT gDI_17; almC := NOT gDI_18;
+  &rarr; Modbus регистр 7 (gAlarmFlags): bit0=almZ, bit1=almC
+  &rarr; Teensy &rarr; JSON: "alm":{"z":0,"c":0}
+  &rarr; EXE: парсинг alm.z / alm.c</code></pre>
+
+      <h3>9.2. Реакция EXE на аларм</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Условие</th><th>Действие EXE</th></tr>
+        <tr><td>alm.z = 1 или alm.c = 1 (вне программы)</td><td>Красная надпись <strong>&laquo;АЛАРМ серво Z/C! (D17/D18)&raquo;</strong> в окнах &laquo;Подключение&raquo; и &laquo;Станок&raquo;</td></tr>
+        <tr class="key-row"><td><strong>alm.z = 1 или alm.c = 1 (во время программы)</strong></td><td><strong>MachPhase &rarr; Error. Программа останавливается.</strong></td></tr>
+      </table>
+      </div>
+
+      <h3>9.3. Действия оператора при аларме</h3>
+      <div class="steps">
+        <ol>
+          <li>Определить код ошибки на дисплее серводрайвера (AL.xx &mdash; см. раздел 03).</li>
+          <li>Устранить причину аварии (перегрузка, перегрев, обрыв энкодера и т.д.).</li>
+          <li>Сбросить аварию на серводрайвере (кнопка RES или цикл питания).</li>
+          <li>Убедиться: DI на ПЛК вернулся в TRUE (D17/D18 = 1), аларм снят в EXE.</li>
+          <li>Повторить Servo ON и продолжить работу.</li>
+        </ol>
+      </div>
+
+      <h2>10. Критерий приёмки (Definition of Done)</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>#</th><th>Критерий</th><th>Метод проверки</th></tr>
+        <tr><td>1</td><td>Бэкап создан и проверен до любых изменений</td><td>Контрольная сумма ZIP-архива</td></tr>
+        <tr><td>2</td><td>EXE запускает цикл гибки кнопкой Start</td><td>Ручная проверка</td></tr>
+        <tr><td>3</td><td>Z/C — Dry Run; гибка — реально через ПЛК → VFD</td><td>Наблюдение + лог</td></tr>
+        <tr><td>4</td><td>Pause / Stop / E-Stop / Resume работают корректно</td><td>Проверка каждой кнопки</td></tr>
+        <tr><td>5</td><td>При аварии &mdash; безопасная остановка, понятная ошибка</td><td>Имитация аварий (EMG, отключение USB, Modbus-обрыв)</td></tr>
+        <tr><td>6</td><td>Watchdog Modbus: потеря связи &gt;2 сек &rarr; снятие Servo-ON</td><td>Отключить RS-485 кабель, проверить watchdog</td></tr>
+        <tr class="key-row"><td><strong>7</strong></td>
+          <td><strong>Интеграционный тест: 10 успешных шагов подряд без ошибок</strong></td>
+          <td><strong>Лог сессии</strong></td>
+        </tr>
+        <tr><td>8</td>
+          <td>Аларм серво (ALM D17/D18): при аварии &mdash; EXE показывает красную надпись, программа переходит в Error</td>
+          <td>Имитация аварии серво (отключить питание серво / вызвать перегрузку), проверить индикацию в EXE</td>
+        </tr>
+      </table>
+      </div>
+
+      <footer>Трубогиб ЧПУ — Мануал v2.1 | Март 2026</footer>
+    </div>
+  </div>
+</div>
+</body>
+</html>

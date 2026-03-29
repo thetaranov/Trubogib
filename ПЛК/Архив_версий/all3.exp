@@ -1,0 +1,116 @@
+VAR_GLOBAL
+    DI1_EncoderA AT %IX0.0 : BOOL;      (* DI1 – A *)
+    DI2_EncoderB AT %IX0.1 : BOOL;      (* DI2 – B *)
+    DI7_CalibButton AT %IX1.0.4 : BOOL; (* DI7 – кнопка калибровки *)
+    DI8_MotorEnable AT %IX1.0.5 : BOOL; (* DI8 – разрешение двигателя *)
+    DI9_ZPulse AT %IX1.0.6 : BOOL;      (* DI9 – Z-импульс *)
+
+    DO1_MotorFwd AT %QX3.0.0 : BOOL;    (* DO1 – прямой ход *)
+    DO2_MotorRev AT %QX3.0.1 : BOOL;    (* DO2 – обратный ход *)
+    DO3_InPosition AT %QX3.0.2 : BOOL;  (* DO3 – индикация позиции *)
+
+    CurrentAngle : REAL;
+    EncoderCount : DINT;
+    Status : INT;
+    ErrorCode : INT;
+    Command : INT;
+END_VARPROGRAM PLC_PRG
+VAR
+    COUNTS_PER_REV : INT := 360;           (* импульсов на оборот *)
+    ANGLE_PER_COUNT : REAL := 1.0;         (* градусов на импульс *)
+    HYSTERESIS : REAL := 1.5;              (* ±1.5° *)
+    MAX_MOVE_TIME : INT := 3000;           (* ~3 с *)
+
+    encoderCount : DINT := 0;
+    prevEncoderA : BOOL := FALSE;
+
+    targetAngle : REAL := 0.0;
+    currentAngle : REAL := 0.0;
+    diffAngle : REAL := 0.0;
+
+    DO1_MotorFwd : BOOL := FALSE;
+    DO2_MotorRev : BOOL := FALSE;
+    DO3_InPosition : BOOL := FALSE;
+
+    moveTimer : INT := 0;
+
+    (* Modbus *)
+    getHold : MB_RD_HOLD_REGS;
+    Buffer : ARRAY[0..255] OF BYTE;
+    cmpl : BOOL;
+    excep : BYTE;
+    DataSize : WORD;
+    tmp_dw : DWORD;
+
+    (* Триггеры *)
+    zPulse_DI9 : R_TRIG;
+    calibButton_DI7 : R_TRIG;
+END_VAR
+
+(* --- Modbus: чтение целевого угла (регистры 0-1 = REAL) --- *)
+getHold(
+    Enable := TRUE,
+    Mode := MB_RTU,
+    DevAddr := 1,
+    FirstAddr := 0,
+    Quantity := 2,
+    ComHandle := 0,
+    TimeOut := T#50ms,
+    Buffer := Buffer,
+    Complete => cmpl,
+    Exception => excep,
+    ByteCnt => DataSize
+);
+
+IF cmpl AND excep = 0 AND DataSize >= 4 THEN
+    tmp_dw := SHL(DWORD(Buffer[0]),24) OR SHL(DWORD(Buffer[1]),16) OR
+              SHL(DWORD(Buffer[2]),8) OR DWORD(Buffer[3]);
+    targetAngle := DWORD_TO_REAL(tmp_dw);
+
+    WHILE targetAngle >= 360.0 DO targetAngle := targetAngle - 360.0; END_WHILE;
+    WHILE targetAngle < 0.0 DO targetAngle := targetAngle + 360.0; END_WHILE;
+END_IF;
+
+(* --- Подсчёт: rising фронт A (360 имп/об), направление по B --- *)
+IF DI1_EncoderA AND NOT prevEncoderA THEN
+    IF DI2_EncoderB THEN encoderCount := encoderCount - 1;
+    ELSE encoderCount := encoderCount + 1; END_IF;
+END_IF;
+prevEncoderA := DI1_EncoderA;
+
+(* Калибровка по Z (DI9) или кнопке (DI7) *)
+zPulse_DI9(CLK := DI9_ZPulse);
+calibButton_DI7(CLK := DI7_CalibButton);
+IF zPulse_DI9.Q OR calibButton_DI7.Q THEN encoderCount := 0; END_IF;
+
+currentAngle := DINT_TO_REAL((encoderCount MOD 360 + 360) MOD 360) * ANGLE_PER_COUNT;
+
+(* Кратчайшая разница ±180° *)
+diffAngle := targetAngle - currentAngle;
+IF diffAngle > 180.0 THEN diffAngle := diffAngle - 360.0;
+ELSIF diffAngle < -180.0 THEN diffAngle := diffAngle + 360.0; END_IF;
+
+(* Позиционирование *)
+IF DI8_MotorEnable THEN
+    IF ABS(diffAngle) <= HYSTERESIS THEN
+        DO1_MotorFwd := FALSE; DO2_MotorRev := FALSE;
+        DO3_InPosition := TRUE; moveTimer := 0; Status := 2;
+    ELSE
+        DO3_InPosition := FALSE; Status := 1;
+        DO1_MotorFwd := (diffAngle > 0.0); DO2_MotorRev := (diffAngle < 0.0);
+        moveTimer := moveTimer + 1;
+        IF moveTimer > MAX_MOVE_TIME THEN
+            DO1_MotorFwd := FALSE; DO2_MotorRev := FALSE;
+            ErrorCode := 1; Status := 0;
+        END_IF;
+    END_IF;
+ELSE
+    DO1_MotorFwd := FALSE; DO2_MotorRev := FALSE; Status := 0;
+END_IF;
+
+IF Command = 2 THEN DO1_MotorFwd := FALSE; DO2_MotorRev := FALSE; Status := 0; END_IF;
+
+CurrentAngle := currentAngle;
+EncoderCount := encoderCount;
+
+END_PROGRAM

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>04. Интеграционный слой — Трубогиб ЧПУ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <strong>ТРУБОГИБ ЧПУ</strong>
+      <span>Мануал v2.1</span>
+    </div>
+    <div class="sidebar-section">Навигация</div>
+    <a href="index.html">&#127968; Главная</a>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Разделы</div>
+    <a href="01_vfd_delta_cp2000.html">01. Привод VFD (Delta CP2000)</a>
+    <a href="02_plc_owen.html">02. ПЛК Owen + Энкодер</a>
+    <a href="03_servo_mitsubishi.html">03. Сервоприводы Mitsubishi</a>
+    <a href="04_control_bridge.html" class="active">04. Интеграционный слой</a>
+    <a href="05_mechanics.html">05. Кинематика осей</a>
+    <a href="06_software_runtime.html">06. ПО и запуск</a>
+  </nav>
+
+  <div class="main-content">
+    <header>
+      <div class="container">
+        <h1>04. Интеграционный слой</h1>
+        <div class="subtitle">Teensy 4.1 + 4&times; MAX490 + 1&times; MAX485. Modbus RTU / USB-Serial.</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <nav class="breadcrumb">
+        <a href="index.html">Главная</a> <span>&rsaquo;</span> 04. Интеграционный слой
+      </nav>
+
+      <h2>1. Обзор архитектуры</h2>
+      <p>Управление станком происходит либо в <strong>Ручном режиме</strong> (физические кнопки/педали на ПЛК, прямой пуск), либо в <strong>Автоматическом режиме</strong> через EXE-программу TubeBender для Windows.</p>
+      <p>В автоматическом режиме EXE обменивается данными с микроконтроллером Teensy 4.1 через USB-Serial интерфейс, используя Modbus-подобный протокол. Teensy 4.1 выполняет две задачи:</p>
+      <ul>
+        <li><strong>Step/Dir генератор:</strong> Отправляет высокочастотные импульсы (до 150 кГц) через MAX490 (линейный драйвер RS-422) по обычной витой паре (LAN кабель) к сервоприводам MR-JE-200A.</li>
+        <li><strong>Modbus Slave (ID=1):</strong> Хранит регистры команд, которые ПЛК Owen PLC110-30 (Master) опрашивает через RS-485 (MAX485).</li>
+      </ul>
+
+      <h2>2. Teensy 4.1 — Центр интеграции</h2>
+
+      <h3>2.1. Общие сведения</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Контроллер</td><td>Teensy 4.1 (ARM Cortex-M7, 600 МГц)</td></tr>
+        <tr><td>Логика</td><td>3.3В</td></tr>
+        <tr><td>Питание</td><td>Внешнее +5В на пин VIN (дорожка VUSB разрезана)</td></tr>
+        <tr><td>Статус</td><td><span class="badge badge-ok">Макетная плата собрана</span></td></tr>
+        <tr><td>Макетка</td><td>4&times; MAX490 (Step/Dir RS-422) + 1&times; MAX485 (Modbus RS-485)</td></tr>
+      </table>
+      </div>
+
+      <h3>2.2. Схема подключения Teensy 4.1 + MAX485 + ПЛК (Modbus RS-485)</h3>
+      <pre><code>Teensy 4.1              MAX485              Owen PLC110-30
+
+RX1 (Pin 0)  &larr;&mdash;&mdash;&mdash;  RO (RX)             (через делитель 5V&rarr;3.3V:
+                                              1 кОм от RO, 2 кОм на GND)
+TX1 (Pin 1)  &rarr;&mdash;&mdash;&mdash;  DI (TX)             (напрямую)
+Pin 24       &rarr;&mdash;&mdash;&mdash;  DE + RE             (управление направлением)
+
+                        A  &larr;&mdash;&mdash;&mdash;&mdash;&mdash;&rarr;  A (RS-485 COM1)
+                        B  &larr;&mdash;&mdash;&mdash;&mdash;&mdash;&rarr;  B (RS-485 COM1)
++5V (VIN)    &rarr;&mdash;&mdash;&mdash;  VCC MAX485
+GND          &rarr;&mdash;&mdash;&mdash;  GND MAX485</code></pre>
+      <p><em>Параметры соединения:</em> <strong>115200 бод, 8 бит данных, нет паритета, 1 стоп-бит (8N1)</strong>. Интерфейс: Serial1 (пины 0 и 1).</p>
+
+      <h3>2.3. Схема подключения Step/Dir через MAX490 (RS-422)</h3>
+      <p>Teensy управляет двумя осями (Z — подача, C — вращение). В связи с требованиями драйвера Mitsubishi MR-JE-200A по дифференциальному сигналу (RS-422), используется трансивер MAX490 для каждого канала (4 модуля на 2 оси):</p>
+
+      <h4>Ось Z (подача каретки) — 2 модуля MAX490</h4>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Teensy Pin</th><th>Функция</th><th>Вход MAX490</th><th>Выход MAX490 (Дифференциал)</th><th>Назначение CN1 50-pin (Серво Z)</th></tr>
+        <tr class="key-row"><td><strong>Pin 2</strong></td><td><strong>Step Z</strong></td><td>Модуль №1 DI (TXD)</td><td>Y &rarr; PP (Step+), Z &rarr; PG (Step&minus;)</td><td>Пин 10 (PP), Пин 11 (PG)</td></tr>
+        <tr class="key-row"><td><strong>Pin 3</strong></td><td><strong>Dir Z</strong></td><td>Модуль №2 DI (TXD)</td><td>Y &rarr; NP (Dir+), Z &rarr; NG (Dir&minus;)</td><td>Пин 35 (NP), Пин 36 (NG)</td></tr>
+      </table>
+      </div>
+
+      <h4>Ось C (вращение патрона) — 2 модуля MAX490</h4>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Teensy Pin</th><th>Функция</th><th>Вход MAX490</th><th>Выход MAX490 (Дифференциал)</th><th>Назначение CN1 50-pin (Серво C)</th></tr>
+        <tr class="key-row"><td><strong>Pin 4</strong></td><td><strong>Step C</strong></td><td>Модуль №3 DI (TXD)</td><td>Y &rarr; PP (Step+), Z &rarr; PG (Step&minus;)</td><td>Пин 10 (PP), Пин 11 (PG)</td></tr>
+        <tr class="key-row"><td><strong>Pin 5</strong></td><td><strong>Dir C</strong></td><td>Модуль №4 DI (TXD)</td><td>Y &rarr; NP (Dir+), Z &rarr; NG (Dir&minus;)</td><td>Пин 35 (NP), Пин 36 (NG)</td></tr>
+      </table>
+      </div>
+
+      <h4>Вспомогательные пины (управление и датчики)</h4>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Teensy Pin</th><th>Направление</th><th>Функция</th><th>Описание</th></tr>
+        <tr><td>Pin 6</td><td>&mdash;</td><td>ЗАПАС</td><td>SON Z теперь через ПЛК DO7 &rarr; синий провод CN1 пин 15</td></tr>
+        <tr><td>Pin 7</td><td>&mdash;</td><td>ЗАПАС</td><td>SON C теперь через ПЛК DO8 &rarr; синий провод CN1 пин 15</td></tr>
+        <tr><td>Pin 8</td><td>&mdash;</td><td>ЗАПАС</td><td>Home Z &mdash; при необходимости</td></tr>
+        <tr><td>Pin 9</td><td>&mdash;</td><td>ЗАПАС</td><td>Home C &mdash; при необходимости</td></tr>
+      </table>
+      </div>
+
+      <div class="alert alert-info">
+        <strong>Настройка серводрайвера:</strong> Pr.PA13 = 0011 (Pulse + Sign, дифференциальный вход). Сигналы Step/Dir идут по LAN кабелю (витая пара) от MAX490 к CN1 50-pin разъёму MR-JE-200A.
+      </div>
+
+      <h2>3. Полная эталонная распиновка Teensy 4.1</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Pin</th><th>Направление</th><th>Сигнал</th><th>Подключение</th></tr>
+        <tr><td>Pin 0 (RX1)</td><td>Вход</td><td>Modbus RX</td><td>MAX485 RO, через делитель (1 кОм + 2 кОм на GND)</td></tr>
+        <tr><td>Pin 1 (TX1)</td><td>Выход</td><td>Modbus TX</td><td>MAX485 DI (напрямую)</td></tr>
+        <tr class="key-row"><td><strong>Pin 2</strong></td><td>Выход</td><td><strong>Step Z</strong></td><td>MAX490 №1 DI &rarr; CN1 PP/PG серво Z</td></tr>
+        <tr class="key-row"><td><strong>Pin 3</strong></td><td>Выход</td><td><strong>Dir Z</strong></td><td>MAX490 №2 DI &rarr; CN1 NP/NG серво Z</td></tr>
+        <tr class="key-row"><td><strong>Pin 4</strong></td><td>Выход</td><td><strong>Step C</strong></td><td>MAX490 №3 DI &rarr; CN1 PP/PG серво C</td></tr>
+        <tr class="key-row"><td><strong>Pin 5</strong></td><td>Выход</td><td><strong>Dir C</strong></td><td>MAX490 №4 DI &rarr; CN1 NP/NG серво C</td></tr>
+        <tr><td>Pin 6</td><td>&mdash;</td><td>ЗАПАС</td><td>SON Z теперь через ПЛК DO7</td></tr>
+        <tr><td>Pin 7</td><td>&mdash;</td><td>ЗАПАС</td><td>SON C теперь через ПЛК DO8</td></tr>
+        <tr><td>Pin 8</td><td>&mdash;</td><td>ЗАПАС</td><td>Home Z &mdash; при необходимости</td></tr>
+        <tr><td>Pin 9</td><td>&mdash;</td><td>ЗАПАС</td><td>Home C &mdash; при необходимости</td></tr>
+        <tr><td>Pin 24</td><td>Выход</td><td>DE/RE</td><td>MAX485 DE + RE (направление RS-485)</td></tr>
+      </table>
+      </div>
+
+      <h2>4. Modbus-команды для ПЛК (Регистры)</h2>
+      <p>ПЛК Owen PLC110-30 выступает Modbus Master, Teensy — Slave (ID=1). Обмен каждые 100 мс.</p>
+
+      <h3>4.1. Регистры записи ПЛК &rarr; Teensy (FC 0x10, 8 регистров)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Адрес</th><th>Имя в ПЛК</th><th>Тип</th><th>Описание</th></tr>
+        <tr class="key-row"><td><strong>0</strong></td><td><strong>gCurrentAngle</strong></td><td>INT (16)</td><td>Текущий угол гибки (&deg;). Обновляется ПЛК от энкодера</td></tr>
+        <tr><td>1</td><td>gTargetAngle</td><td>INT (16)</td><td>Целевой угол гибки (&deg;)</td></tr>
+        <tr><td>2</td><td>gCycleNum</td><td>INT (16)</td><td>Номер цикла (1 = гибка, 2 = возврат)</td></tr>
+        <tr><td>3</td><td>gMode</td><td>INT (16)</td><td>Режим: 0 = ручной, 1 = авто</td></tr>
+        <tr><td>4</td><td>gDone</td><td>INT (16)</td><td>Достижение цели: 0/1</td></tr>
+        <tr><td>5</td><td>gPedalFwd</td><td>INT (16)</td><td>Педаль вперёд: 0/1</td></tr>
+        <tr><td>6</td><td>gPedalRev</td><td>INT (16)</td><td>Педаль назад: 0/1</td></tr>
+        <tr class="key-row"><td><strong>7</strong></td><td><strong>gAlarmFlags</strong></td><td>INT (16)</td><td><strong>Флаги аварий серво: bit 0 = almZ (серво Z), bit 1 = almC (серво C). 1 = авария</strong></td></tr>
+      </table>
+      </div>
+
+      <h3>4.2. Регистры чтения Teensy &rarr; ПЛК (FC 0x03, 2 регистра)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Адрес</th><th>Имя</th><th>Тип</th><th>Описание</th></tr>
+        <tr><td>9</td><td>gExtCommand</td><td>INT (16)</td><td>Команда: 0=Ничего, 1=START, 2=STOP, 3=ZERO (обнулить энкодер), 4=AUTO_BEND, 6=SON ON (DO7/DO8 + сброс done/cycle), 7=SON OFF, 10=E-STOP</td></tr>
+        <tr><td>10</td><td>gExtTarget</td><td>INT (16)</td><td>Целевой угол от внешнего управления (&deg;)</td></tr>
+      </table>
+      </div>
+
+      <h3>4.3. Команды CMD через регистр 9 (EXE &rarr; Teensy &rarr; ПЛК)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>CMD</th><th>Имя</th><th>Действие в ПЛК</th></tr>
+        <tr><td>1</td><td>START</td><td>done := FALSE; gCycle := 1; gTargetAngle := gDefaultTarget (только авто-режим)</td></tr>
+        <tr><td>2</td><td>STOP</td><td>done := TRUE; autoBend := FALSE</td></tr>
+        <tr><td>3</td><td>ZERO</td><td>Обнулить энкодер, done := FALSE, gCycle := 1</td></tr>
+        <tr><td>4</td><td>AUTO_BEND</td><td>autoBend := TRUE (авто-режим, NOT done)</td></tr>
+        <tr><td>6</td><td>SON_ON</td><td>sonZ := TRUE; sonC := TRUE; done := FALSE; autoBend := FALSE; gCycle := 1 &rarr; DO7/DO8 = ON. <strong>Блокируется для оси с активным алармом (almZ/almC)</strong></td></tr>
+        <tr><td>7</td><td>SON_OFF</td><td>sonZ := FALSE; sonC := FALSE; autoBend := FALSE; done := TRUE &rarr; DO7/DO8 = OFF</td></tr>
+        <tr><td>10</td><td>E-STOP</td><td>sonZ := FALSE; sonC := FALSE; autoBend := FALSE; done := TRUE &rarr; аварийная остановка</td></tr>
+      </table>
+      </div>
+      <p><strong>Важно:</strong> команды SON/E-STOP передаются как level-команды (без короткого импульса), чтобы ПЛК не пропускал их при джиттере опроса Modbus.</p>
+
+      <h2>5. Аварийные сигналы серво (ALM) &mdash; D17/D18</h2>
+
+      <h3>5.1. Цепочка аварийного сигнала</h3>
+      <pre><code>MR-JE-200A ALM (CN1 pin 37, бело-голубой провод, b-contact NC)
+  &rarr; ПЛК Owen DI: D17 (gDI_17 AT %IX1.1.6) = Серво Z ALM
+                    D18 (gDI_18 AT %IX1.1.7) = Серво C ALM
+  &rarr; Modbus регистр 7 (gAlarmFlags): bit0 = almZ, bit1 = almC
+  &rarr; Teensy 4.1 (читает рег. 7)
+  &rarr; USB-Serial JSON: {"alm":{"z":0,"c":0}}
+  &rarr; EXE TubeBender (отображение + защита)</code></pre>
+
+      <h3>5.2. Поведение b-contact (выход ALM серводрайвера MR-JE-200A)</h3>
+      <p>По умолчанию выход ALM серводрайвера MR-JE-200A (CN1 pin 37) настроен как <strong>b-contact</strong> (нормально замкнутый, NC):</p>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Состояние серво</th><th>Транзистор выхода ALM</th><th>Уровень на DI ПЛК</th><th>Интерпретация</th></tr>
+        <tr><td>Норма (нет аварии)</td><td>Включён (ON)</td><td>TRUE (лог. 1)</td><td>Нормальная работа</td></tr>
+        <tr class="key-row"><td><strong>Авария (AL.xx)</strong></td><td><strong>Выключен (OFF)</strong></td><td><strong>FALSE (лог. 0)</strong></td><td><strong>Авария серво!</strong></td></tr>
+      </table>
+      </div>
+
+      <h3>5.3. Логика защиты в ПЛК</h3>
+      <p>ПЛК детектирует аварию инверсией входа (b-contact):</p>
+      <pre><code>almZ := NOT gDI_17;   (* DI=FALSE &rarr; almZ=TRUE &rarr; авария серво Z *)
+almC := NOT gDI_18;   (* DI=FALSE &rarr; almC=TRUE &rarr; авария серво C *)</code></pre>
+      <p>При обнаружении аварии ПЛК выполняет:</p>
+      <ul>
+        <li>Снятие SON (Servo ON) для аварийной оси: <code>sonZ := FALSE</code> / <code>sonC := FALSE</code></li>
+        <li>Остановка автоматического цикла: <code>autoBend := FALSE</code></li>
+        <li>Установка флага завершения: <code>done := TRUE</code></li>
+        <li>CMD 6 (SON ON) блокируется для оси с активным алармом</li>
+      </ul>
+
+      <h3>5.4. Обработка аларма в Teensy и EXE</h3>
+      <p>Teensy читает регистр 7 (gAlarmFlags) из Modbus и добавляет в JSON-статус поле <code>"alm":{"z":0,"c":0}</code> (0 = норма, 1 = авария). При обнаружении аларма Teensy останавливает оси и снимает SON.</p>
+      <p>EXE TubeBender парсит <code>alm.z</code> и <code>alm.c</code> из JSON и отображает <span style="color:#a22"><strong>&laquo;АЛАРМ серво Z/C! (D17/D18)&raquo;</strong></span> красным текстом в окнах &laquo;Подключение&raquo; и &laquo;Станок&raquo;. Если аларм возникает во время выполнения программы, конечный автомат (MachPhase) переходит в фазу <strong>Error</strong>.</p>
+
+      <h2>6. Важные технические константы</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Интерфейс связи с ПЛК</td><td>Serial1 (пины 0 и 1), через MAX485</td></tr>
+        <tr><td>Скорость Modbus</td><td><strong>115200 бод, 8N1</strong></td></tr>
+        <tr><td>Slave ID</td><td>1</td></tr>
+        <tr><td>Логика Step/Dir</td><td>Дифференциальная RS-422 (через MAX490)</td></tr>
+        <tr><td>Настройка серво Pr.PA13</td><td>0011 (Pulse + Sign)</td></tr>
+        <tr><td>Питание SON</td><td>+24В от ПЛК: DO7 &rarr; CN1 пин 15 (Z), DO8 &rarr; CN1 пин 15 (C). Teensy пины 6-9 — ЗАПАС</td></tr>
+        <tr><td>Watchdog Modbus</td><td>&gt; 2 сек без связи &rarr; прекратить Step/Dir, снять Servo-ON</td></tr>
+        <tr><td>Макс. частота импульсов</td><td>до 150 кГц (двухосевой режим)</td></tr>
+        <tr><td>Разрешение драйвера</td><td>10 000 импульсов/оборот</td></tr>
+      </table>
+      </div>
+
+      <footer>Трубогиб ЧПУ — Мануал v2.1 | Март 2026</footer>
+    </div>
+  </div>
+</div>
+</body>
+</html>

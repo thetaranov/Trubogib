@@ -1,0 +1,70 @@
+(* Corrected IO address mapping suggestions for PLC project
+   - This file contains two VAR_GLOBAL blocks:
+     1) "canonical" mapping (matches `new/GLOBAL_VARIABLES.EXP` and earlier project exports)
+     2) "alternate" mapping (swap fast outputs vs. relay outputs) to try if DOs are wired/assigned differently
+   - Import one block at a time into your CODESYS project (or copy the appropriate VAR_GLOBAL section
+     into your Global Variables export) and test which physical terminals energize.
+   - After testing, tell me which logical `gDO_n` produced which physical terminal so I can finalize mappings.
+
+   NOTE: Internet fetch of vendor documentation failed from this environment; mappings below are based
+   on the project's exported `GLOBAL_VARIABLES` and a common alternate hypothesis when module addresses
+   are swapped (fast outputs vs. relay outputs). Use the alternate block only if the canonical mapping
+   produces incorrect physical outputs.
+*)
+
+(* ===== Canonical mapping (current project) ===== *)
+VAR_GLOBAL
+    (* Discrete outputs - relay DO1..DO8 mapped to %QX3.0.0..%QX3.0.7 *)
+    gDO_1 AT %QX3.0.0 : BOOL;  (* DO1 - Forward *)
+    gDO_2 AT %QX3.0.1 : BOOL;  (* DO2 - Reverse *)
+    gDO_3 AT %QX3.0.2 : BOOL;  (* DO3 - In position indicator *)
+    gDO_4 AT %QX3.0.3 : BOOL;  (* DO4 *)
+    gDO_5 AT %QX3.0.4 : BOOL;  (* DO5 *)
+    gDO_6 AT %QX3.0.5 : BOOL;  (* DO6 *)
+    gDO_7 AT %QX3.0.6 : BOOL;  (* DO7 *)
+    gDO_8 AT %QX3.0.7 : BOOL;  (* DO8 *)
+
+    (* Fast/transistor discrete outputs DO9..DO12 mapped to %QX2.0..%QX2.3 (fast outputs module) *)
+    gDO_9  AT %QX2.0 : BOOL; (* DO9  - fast/transistor output *)
+    gDO_10 AT %QX2.1 : BOOL; (* DO10 *)
+    gDO_11 AT %QX2.2 : BOOL; (* DO11 *)
+    gDO_12 AT %QX2.3 : BOOL; (* DO12 *)
+END_VAR
+
+(* ===== Alternate mapping (swap QX2/QX3 addressing) =====
+   Use this block if setting gDO_10 energizes the physical terminal labeled DO1.
+   This maps DO1..DO8 to %QX2.0..%QX2.7 and DO9..DO12 to %QX3.0..%QX3.3.
+   Some PLC configurations place the fast outputs on the same byte as the relay outputs
+   depending on module order — this alternate is a common corrective mapping to try.
+*)
+VAR_GLOBAL
+    (* Discrete outputs - relay DO1..DO8 mapped to %QX2.0..%QX2.7 (alternate hypothesis) *)
+    gDO_1 AT %QX2.0 : BOOL;  (* DO1 - Forward (ALT) *)
+    gDO_2 AT %QX2.1 : BOOL;  (* DO2 - Reverse (ALT) *)
+    gDO_3 AT %QX2.2 : BOOL;  (* DO3 - In position indicator (ALT) *)
+    gDO_4 AT %QX2.3 : BOOL;  (* DO4 (ALT) *)
+    gDO_5 AT %QX2.4 : BOOL;  (* DO5 (ALT) *)
+    gDO_6 AT %QX2.5 : BOOL;  (* DO6 (ALT) *)
+    gDO_7 AT %QX2.6 : BOOL;  (* DO7 (ALT) *)
+    gDO_8 AT %QX2.7 : BOOL;  (* DO8 (ALT) *)
+
+    (* Fast/transistor discrete outputs DO9..DO12 mapped to %QX3.0..%QX3.3 (alternate hypothesis) *)
+    gDO_9  AT %QX3.0 : BOOL; (* DO9  - fast/transistor output (ALT) *)
+    gDO_10 AT %QX3.1 : BOOL; (* DO10 (ALT) *)
+    gDO_11 AT %QX3.2 : BOOL; (* DO11 (ALT) *)
+    gDO_12 AT %QX3.3 : BOOL; (* DO12 (ALT) *)
+END_VAR
+
+(* ===== How to test =====
+ 1) Save this file and import the desired VAR_GLOBAL block into your project (or copy/paste into
+    your Global Variables export and recompile).
+ 2) Put the PLC ONLINE and, in the watch window or by forcing, set only `gDO_10 := TRUE` and observe
+    which physical terminal energizes.
+ 3) If the physical terminal you expect (DO10) energizes, keep the canonical mapping; otherwise
+    try the alternate mapping and retest.
+ 4) Report which logical `gDO_n` maps to which physical terminal (DO1..DO12) and I will generate
+    the final authoritative `GLOBAL_VARIABLES.EXP` to match your hardware.
+
+NOTE: If you prefer, I can create a single EXP that reassigns every `gDO_n` to the exact physical
+addresses you observe once you tell me the observed mapping.
+*)

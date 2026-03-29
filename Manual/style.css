@@ -1,0 +1,381 @@
+/* ═══════════════════════════════════════════════════════
+   Трубогиб ЧПУ — Индустриальный мануал v2.1
+   Стиль: тёмно-синяя акцентура, строгие таблицы,
+          фиксированное боковое меню навигации
+   ═══════════════════════════════════════════════════════ */
+:root {
+  --bg:          #111827;
+  --bg-card:     #1c2333;
+  --bg-code:     #0d1117;
+  --bg-sidebar:  #0a0f1c;
+  --text:        #d1d5db;
+  --text-muted:  #6b7280;
+  --accent:      #60a5fa;
+  --accent-dark: #1a237e;
+  --accent2:     #34d399;
+  --accent3:     #fbbf24;
+  --border:      #1e2d45;
+  --danger:      #f87171;
+  --warning:     #fb923c;
+  --success:     #4ade80;
+  --link:        #93c5fd;
+  --shadow:      rgba(0,0,0,0.4);
+  --sidebar-w:   240px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 15px; scroll-behavior: smooth; }
+body {
+  font-family: 'Inter', 'Roboto', 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  min-height: 100vh;
+}
+
+/* ══ Page Layout ════════════════════════════════════════ */
+.page-wrapper {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ══ Sidebar ════════════════════════════════════════════ */
+.sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  background: var(--bg-sidebar);
+  border-right: 2px solid var(--accent-dark);
+  flex-shrink: 0;
+  z-index: 100;
+}
+.sidebar::-webkit-scrollbar { width: 4px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+.sidebar-logo {
+  padding: 1.3rem 1.2rem 1rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+.sidebar-logo strong {
+  display: block;
+  font-size: 1rem;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: 0.02em;
+  margin-bottom: 0.15rem;
+}
+.sidebar-logo span {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.sidebar-section {
+  padding: 0.8rem 1.2rem 0.2rem;
+  font-size: 0.67rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+.sidebar a {
+  display: block;
+  padding: 0.42rem 1.2rem 0.42rem 1.4rem;
+  color: #9ca3af;
+  text-decoration: none;
+  font-size: 0.82rem;
+  line-height: 1.4;
+  border-left: 3px solid transparent;
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.sidebar a:hover {
+  background: rgba(96,165,250,0.07);
+  color: var(--accent);
+  border-left-color: var(--accent);
+}
+.sidebar a.active {
+  background: rgba(26,35,126,0.45);
+  color: #fff;
+  border-left-color: var(--accent);
+  font-weight: 600;
+}
+.sidebar-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 0.6rem 1.2rem;
+}
+
+/* ══ Main Content ═══════════════════════════════════════ */
+.main-content {
+  flex: 1;
+  min-width: 0;
+  overflow-x: hidden;
+}
+
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 2rem 4rem;
+}
+
+/* ══ Header ═════════════════════════════════════════════ */
+header {
+  background: linear-gradient(135deg, #0d1226 0%, var(--accent-dark) 60%, #1e3a7c 100%);
+  padding: 1.8rem 0;
+  border-bottom: 3px solid var(--accent-dark);
+  margin-bottom: 0;
+}
+header .container { padding-top: 0; padding-bottom: 0; }
+header h1 {
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 0.25rem;
+  letter-spacing: -0.01em;
+}
+header .subtitle {
+  color: #93c5fd;
+  font-size: 0.88rem;
+  font-weight: 400;
+}
+
+/* ══ Breadcrumb ═════════════════════════════════════════ */
+nav.breadcrumb {
+  padding: 0.8rem 0 0;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+}
+nav.breadcrumb a { color: var(--link); text-decoration: none; }
+nav.breadcrumb a:hover { text-decoration: underline; }
+nav.breadcrumb span { margin: 0 0.35rem; }
+
+/* ══ Section headings ═══════════════════════════════════ */
+h1, h2, h3, h4 { color: #fff; font-weight: 600; }
+h1 { font-size: 1.6rem; margin-bottom: 1rem; }
+h2 {
+  font-size: 1.25rem;
+  margin-top: 2.5rem;
+  margin-bottom: 0.9rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 2px solid var(--border);
+  color: #e2e8f0;
+}
+h3 { font-size: 1.05rem; margin-top: 1.5rem; margin-bottom: 0.5rem; color: #cbd5e1; }
+h4 { font-size: 0.95rem; margin-top: 1rem; margin-bottom: 0.35rem; color: var(--accent); }
+
+/* ══ Text ════════════════════════════════════════════════ */
+p { margin-bottom: 0.75rem; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { color: #f1f5f9; }
+em { color: var(--accent3); font-style: normal; font-weight: 500; }
+
+/* ══ Lists ═══════════════════════════════════════════════ */
+ul, ol { margin: 0.4rem 0 0.9rem 1.5rem; }
+li { margin-bottom: 0.25rem; }
+
+/* ══ Tables ══════════════════════════════════════════════ */
+.table-wrap { overflow-x: auto; margin: 1rem 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  min-width: 400px;
+}
+th, td {
+  padding: 0.55rem 0.85rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  background: #0f1e36;
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+tr:nth-child(even) td { background: rgba(255,255,255,0.018); }
+tr:hover td { background: rgba(96,165,250,0.06); }
+td.mono { font-family: 'Cascadia Code','Fira Code','Consolas',monospace; font-size: 0.83rem; }
+td.center { text-align: center; }
+td.bold { color: #fff; font-weight: 600; }
+
+/* Key rows highlight */
+tr.key-row td { background: rgba(26,35,126,0.35) !important; }
+tr.key-row td:first-child { border-left: 3px solid var(--accent); }
+
+/* ══ Code ════════════════════════════════════════════════ */
+code {
+  background: var(--bg-code);
+  color: var(--accent3);
+  padding: 0.12rem 0.4rem;
+  border-radius: 3px;
+  font-family: 'Cascadia Code','Fira Code','Consolas',monospace;
+  font-size: 0.87em;
+  border: 1px solid var(--border);
+}
+pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent-dark);
+  border-radius: 6px;
+  padding: 1rem 1.2rem;
+  overflow-x: auto;
+  margin: 0.8rem 0 1.2rem;
+  line-height: 1.55;
+}
+pre code {
+  background: none;
+  padding: 0;
+  color: #cdd5e0;
+  border: none;
+  font-size: 0.85rem;
+}
+
+/* ══ Alerts ══════════════════════════════════════════════ */
+.alert {
+  border-radius: 6px;
+  padding: 0.9rem 1.1rem;
+  margin: 1rem 0;
+  border-left: 4px solid;
+  font-size: 0.9rem;
+}
+.alert-info    { background: rgba(96,165,250,0.07);  border-color: var(--accent); }
+.alert-warn    { background: rgba(251,146,60,0.08);  border-color: var(--warning); }
+.alert-danger  { background: rgba(248,113,113,0.09); border-color: var(--danger); }
+.alert-success { background: rgba(74,222,128,0.07);  border-color: var(--success); }
+.alert strong  { display: block; margin-bottom: 0.25rem; font-size: 0.95rem; }
+
+/* ══ Status badges ═══════════════════════════════════════ */
+.badge {
+  display: inline-block;
+  padding: 0.12rem 0.55rem;
+  border-radius: 3px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.badge-ok   { background: #166534; color: #4ade80; border: 1px solid #166534; }
+.badge-wip  { background: #78350f; color: #fbbf24; border: 1px solid #78350f; }
+.badge-wait { background: #1e3a5f; color: #60a5fa; border: 1px solid #1e3a5f; }
+.badge-plan { background: #374151; color: #9ca3af; border: 1px solid #374151; }
+
+/* ══ Pin number highlight ════════════════════════════════ */
+.pin {
+  display: inline-block;
+  background: var(--accent-dark);
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.8rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 3px;
+  font-family: monospace;
+  min-width: 2em;
+  text-align: center;
+}
+
+/* ══ Step callouts ═══════════════════════════════════════ */
+.steps ol { list-style: none; margin: 0; padding: 0; counter-reset: step-counter; }
+.steps ol li {
+  counter-increment: step-counter;
+  padding: 0.6rem 0.8rem 0.6rem 3rem;
+  margin-bottom: 0.4rem;
+  background: var(--bg-card);
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  position: relative;
+  font-size: 0.9rem;
+}
+.steps ol li::before {
+  content: counter(step-counter);
+  position: absolute;
+  left: 0.8rem;
+  top: 0.6rem;
+  background: var(--accent-dark);
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.8rem;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ══ Card grid (index page) ══════════════════════════════ */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+  margin: 1.2rem 0;
+}
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.2rem 1.4rem;
+  transition: transform 0.13s, border-color 0.13s;
+  text-decoration: none;
+  color: var(--text);
+  display: block;
+}
+.card:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+  box-shadow: 0 4px 16px var(--shadow);
+}
+.card .card-num {
+  display: inline-block;
+  background: var(--accent-dark);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 0.72rem;
+  padding: 0.1rem 0.55rem;
+  border-radius: 3px;
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.05em;
+}
+.card h3 { font-size: 1rem; margin: 0.3rem 0 0.3rem; color: #fff; margin-top: 0; }
+.card p  { font-size: 0.82rem; color: var(--text-muted); margin: 0; }
+
+/* ══ Footer ══════════════════════════════════════════════ */
+footer {
+  margin-top: 3rem;
+  padding-top: 1.2rem;
+  border-top: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+/* ══ Responsive ══════════════════════════════════════════ */
+@media (max-width: 900px) {
+  .page-wrapper { flex-direction: column; }
+  .sidebar {
+    width: 100%;
+    height: auto;
+    position: static;
+    border-right: none;
+    border-bottom: 2px solid var(--accent-dark);
+    padding: 0.8rem 0;
+  }
+  .sidebar a { display: inline-block; padding: 0.3rem 0.8rem; }
+  .sidebar-section { display: inline-block; padding: 0.3rem 0.8rem; }
+  .sidebar-divider { display: none; }
+  .main-content { min-width: 0; }
+  .container { padding: 1rem 1rem 2rem; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.1rem; }
+  table { font-size: 0.8rem; }
+  th, td { padding: 0.4rem 0.5rem; }
+}

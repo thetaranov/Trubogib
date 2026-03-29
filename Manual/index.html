@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Главная — Трубогиб ЧПУ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <strong>ТРУБОГИБ ЧПУ</strong>
+      <span>Мануал v2.1</span>
+    </div>
+    <div class="sidebar-section">Навигация</div>
+    <a href="index.html" class="active">&#127968; Главная</a>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Разделы</div>
+    <a href="01_vfd_delta_cp2000.html">01. Привод VFD (Delta CP2000)</a>
+    <a href="02_plc_owen.html">02. ПЛК Owen + Энкодер</a>
+    <a href="03_servo_mitsubishi.html">03. Сервоприводы Mitsubishi</a>
+    <a href="04_control_bridge.html">04. Интеграционный слой</a>
+    <a href="05_mechanics.html">05. Кинематика осей</a>
+    <a href="06_software_runtime.html">06. ПО и запуск</a>
+  </nav>
+
+  <div class="main-content">
+    <header>
+      <div class="container">
+        <h1>Трубогиб ЧПУ — Руководство по эксплуатации</h1>
+        <div class="subtitle">Модернизированный советский трубогиб. 3 оси: гибка (VFD+ПЛК), подача Z (серво), вращение C (серво).</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <nav class="breadcrumb">Трубогиб ЧПУ &gt; Главная</nav>
+
+      <h2>Разделы мануала</h2>
+
+      <div class="card-grid">
+        <a href="01_vfd_delta_cp2000.html" class="card">
+          <span class="card-num">01</span>
+          <h3>Привод гибочной оси (VFD)</h3>
+          <p>Delta CP2000 VFD037CP43B-21, 3.7 кВт. Управление от реле ПЛК, параметры, торможение.</p>
+        </a>
+        <a href="02_plc_owen.html" class="card">
+          <span class="card-num">02</span>
+          <h3>ПЛК Owen + Энкодер</h3>
+          <p>PLC110-24.30.Р-М, энкодер Briter 360 P/R. Таблица I/O, карта Modbus, CoDeSys 2.3.9.</p>
+        </a>
+        <a href="03_servo_mitsubishi.html" class="card">
+          <span class="card-num">03</span>
+          <h3>Сервоприводы Mitsubishi</h3>
+          <p>MR-JE-200A + HG-SN152J-S100. Распиновка CN1 (50-pin), питание SON/EMG, Step/Dir через MAX490.</p>
+        </a>
+        <a href="04_control_bridge.html" class="card">
+          <span class="card-num">04</span>
+          <h3>Интеграционный слой</h3>
+          <p>Teensy 4.1 + MAX490 + MAX485. Modbus RTU шлейф. Прямое управление от ПК.</p>
+        </a>
+        <a href="05_mechanics.html" class="card">
+          <span class="card-num">05</span>
+          <h3>Кинематика осей</h3>
+          <p>Ось Z: рейка M2, Z35, редуктор 1:8 → 27.49 мм/об. Ось C: Z35/Z105, редуктор 1:20 → i=60:1.</p>
+        </a>
+        <a href="06_software_runtime.html" class="card">
+          <span class="card-num">06</span>
+          <h3>ПО и запуск (Dry Run)</h3>
+          <p>EXE TubeBender v2.1. Режим Dry Run, синхронизация STEP_DONE, последовательность запуска.</p>
+        </a>
+      </div>
+
+      <h2>Статус компонентов</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Компонент</th><th>Модель</th><th>Статус</th><th>Примечание</th></tr>
+        <tr>
+          <td>Привод гибки (VFD)</td>
+          <td class="mono">VFD037CP43B-21</td>
+          <td><span class="badge badge-ok">Работает</span></td>
+          <td>Delta CP2000, 3.7 кВт, 380В</td>
+        </tr>
+        <tr>
+          <td>ПЛК + энкодер</td>
+          <td class="mono">PLC110-24.30.Р-М</td>
+          <td><span class="badge badge-ok">Работает</span></td>
+          <td>Owen, CoDeSys 2.3.9, ось гибки полностью отлажена</td>
+        </tr>
+        <tr>
+          <td>Сервопривод #1 (ось Z)</td>
+          <td class="mono">MR-JE-200A</td>
+          <td><span class="badge badge-wip">JOG проверен</span></td>
+          <td>Step/Dir не подключён (ожидает Teensy)</td>
+        </tr>
+        <tr>
+          <td>Сервопривод #2 (ось C)</td>
+          <td class="mono">MR-JE-200A</td>
+          <td><span class="badge badge-wip">JOG проверен</span></td>
+          <td>Step/Dir не подключён (ожидает Teensy)</td>
+        </tr>
+        <tr>
+          <td>Teensy 4.1 (шлюз + Motion Controller)</td>
+          <td class="mono">PJRC Teensy 4.1</td>
+          <td><span class="badge badge-wip">Макетка собрана</span></td>
+          <td>4&times; MAX490 + 1&times; MAX485. Modbus Slave (ID=1, к ПЛК), Step/Dir &times; 2, USB-Serial от ПК</td>
+        </tr>
+        <tr>
+          <td>EXE TubeBender</td>
+          <td class="mono">v2.1 (C++/OCCT)</td>
+          <td><span class="badge badge-ok">Работает</span></td>
+          <td>3D-редактор, визуализация, Runtime в разработке</td>
+        </tr>
+      </table>
+      </div>
+
+      <h2>Архитектура системы</h2>
+
+      <h3>Текущая интеграция</h3>
+      <pre><code>EXE TubeBender v2.1 (Windows)
+  │  USB-Serial / Modbus RTU
+  ▼
+Teensy 4.1 (шлюз и генератор импульсов)
+  ├── Step/Dir → MAX490 → Кабель LAN → CN1 → MR-JE-200A #1 → Рейка Z
+  ├── Step/Dir → MAX490 → Кабель LAN → CN1 → MR-JE-200A #2 → Патрон C
+  └── Modbus RTU RS-485 → Owen PLC110-30
+      └── DO10/DO11 → Delta CP2000 → Мотор гибки
+</code></pre>
+
+      <h2>Безопасность — обязательно перед первым включением</h2>
+
+      <div class="alert alert-danger">
+        <strong>Работа с 380В — только при отключённом питании!</strong>
+        Перед любыми работами в шкафу: выключить автоматы, проверить отсутствие
+        напряжения на клеммах L1/L2/L3 мультиметром. Конденсаторы VFD/серво разряжаются
+        до 30 секунд после отключения — подождать!
+      </div>
+
+      <h3>Аппаратный аварийный стоп (E-Stop)</h3>
+      <ul>
+        <li>Кнопка-грибок с самоблокировкой (НЗ контакт, NC) — разрывает цепь 24В.</li>
+        <li>Принцип безопасного отказа: обрыв провода = остановка (fail-safe).</li>
+        <li>Цепь E-Stop подключается на вход <strong>DI0 (пин 19)</strong> каждого серводрайвера MR-JE-200A.</li>
+        <li>VFD: E-Stop — через вход <strong>MI3</strong> (внешняя авария) Delta CP2000.</li>
+      </ul>
+
+      <h3>Заземление (PE)</h3>
+      <ul>
+        <li>Шкаф → PE шина → заземляющий контур здания (R ≤ 4 Ом).</li>
+        <li>Все корпуса оборудования: VFD, сервоусилители, ПЛК → на общую PE шину.</li>
+        <li>Экраны кабелей CN1/CN2 → заземлить с одной стороны (со стороны серводрайвера).</li>
+        <li>Силовые кабели (U/V/W) держать отдельно от сигнальных минимум на 30 см.</li>
+      </ul>
+
+      <h3>Минимальный порядок включения</h3>
+      <div class="steps">
+        <ol>
+          <li>Убедиться, что E-Stop кнопка нажата (разомкнута). Проверить заземление.</li>
+          <li>Включить главный автомат 380В → питание VFD и сервоусилителей.</li>
+          <li>Включить автомат 24В → питание ПЛК, ESP8266, дискретных цепей.</li>
+          <li>Дождаться готовности ПЛК (5–10 сек после подачи питания).</li>
+          <li>Разблокировать E-Stop (повернуть кнопку). Убедиться в <code>d09</code> на дисплее серво.</li>
+        </ol>
+      </div>
+
+      <footer>Трубогиб ЧПУ — Мануал v2.1 | Март 2026</footer>
+    </div>
+  </div>
+</div>
+</body>
+</html>

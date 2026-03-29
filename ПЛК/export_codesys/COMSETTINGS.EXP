@@ -1,0 +1,52 @@
+(* @NESTEDCOMMENTS := 'Yes' *)
+(* @PATH := '' *)
+(* @OBJECTFLAGS := '0, 8' *)
+
+(* Minimal stub type to satisfy COM_SERVICE/library references when the
+    real COMSETTINGS type is not present in project sources. Replace with
+    proper definition from the communication library if available. *)
+TYPE COMSETTINGS : INT;
+END_TYPE
+
+PROGRAM ModbusMasterPoll
+VAR
+  mbRes : INT;
+  mbBuf : ARRAY[0..15] OF WORD; (* ����� ��������� �� ESP *)
+  (* ��������� ���������� *)
+  dw : DWORD;
+  tmpReal : REAL;
+END_VAR
+
+(* Примечание: вызов чтения holding-регистров ESP. Пример использования
+     через библиотечную функцию/FB:
+     ModbusReadHolding(Port := 1, SlaveID := 1, StartAddr := 0,
+                                         Quantity := 11, pBuffer := ADR(mbBuf));
+     Параметры:
+         - SlaveID: адрес ESP (по умолчанию cfg.plcAddress = 1)
+         - StartAddr: 0 (начало карты регистров ESP)
+         - Quantity: 11 (регистры 0..10: target(2), current(2), status, err, cmd, encoder(2), ppr)
+*)
+
+mbRes := MB_RD_HOLD_REGS(Port := 1, SlaveID := 1, StartAddr := 0, Quantity := 11, pBuffer := ADR(mbBuf));
+IF mbRes = 0 THEN
+  (* unpack targetAngle (REAL) � ESP ����� hi-word � ���[0], lo-word � ���[1] *)
+  dw := SHL(DWORD(mbBuf[0]),16) OR DWORD(mbBuf[1]);
+  tmpReal := DWORD_TO_REAL(dw); (* ��� ����������� �����������/CAST ��������� � ����� CoDeSys *)
+  gTargetAngle := tmpReal;
+
+  (* unpack currentAngle *)
+  dw := SHL(DWORD(mbBuf[2]),16) OR DWORD(mbBuf[3]);
+  gCurrentAngle := DWORD_TO_REAL(dw);
+
+  (*  status/error/command *)
+  gStatus := TO_INT(mbBuf[6]);
+  gErrorCode := TO_INT(mbBuf[7]);
+  gCommand := TO_INT(mbBuf[8]);
+
+  (* encoder 32-bit (hi/lo) *)
+  gEncoderCount := DINT(mbBuf[9]) * 65536 + DINT(mbBuf[10]);
+
+  (*  optional: settings *)
+  gCalibCountsPerRev := DINT(mbBuf[11]); (*  PPR OR similar *)
+END_IF
+(* @END_DECLARATION := '0' *)

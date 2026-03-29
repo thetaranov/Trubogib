@@ -1,0 +1,14 @@
+LIBRARY
+SysLibCom.lib 20.2.06 12:31:08
+(* @LIBRARYSYMFILEINFO := '0' *)
+NumOfPOUs: 7
+SysComClose: 0
+SysComGetVersion2300: 0
+SysComOpen: 0
+SysComRead: 0
+SysComSetSettings: 0
+SysComSetSettingsEx: 0
+SysComWrite: 0
+NumOfGVLs: 1
+Globale_Variablen: 0
+END_LIBRARY

@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<Root>
+	<Application name="MELSOFT MR Configurator2" version="1.70Y">
+		<fileType>USERDATA</fileType>
+		<dataType>ALARM_MONITOR</dataType>
+		<lang>en</lang>
+		<connection>USB</connection>
+		<Controller>
+			<connection/>
+			<type/>
+		</Controller>
+	</Application>
+	<Axes>
+		<Axis no="1" nameNo="1">
+			<ampType>MR-JE-A</ampType>
+			<ampBaseType>21</ampBaseType>
+			<ampSoftwareNo>BCD-B46W100 (factory setting)</ampSoftwareNo>
+			<ampOptionUnitType>No Connection</ampOptionUnitType>
+		</Axis>
+	</Axes>
+	<ALARM_MONITOR>
+		<AlarmNo>E6.1</AlarmNo>
+		<AlarmName>Servo forced stop warning</AlarmName>
+		<AlarmDetail>01</AlarmDetail>
+		<Time>0</Time>
+		<MonitorData>
+1,Cumulative feedback pulses,0,pulse
+2,Servo motor speed,0,r/min
+3,Droop pulse,0,pulse
+4,Cumulative cmd. pulses,0,pulse
+5,Command pulse frequency,0,kpulse/s
+6,Analog speed command voltage,-0.04,V
+7,Analog torque command voltage,-0.01,V
+8,Regenerative load ratio,0,%
+9,Effective load ratio,0,%
+10,Peak load ratio,0,%
+11,Instantaneous torque,0,%
+12,Within one-revolution position,19101,pulse
+13,ABS counter,0,rev
+14,Load inertia moment ratio,7.00,times
+15,Bus voltage,311,V
+33,Internal temperature of encoder,39,°C
+34,Settling time,0,ms
+35,Oscillation detection frequency,0,Hz
+36,Number of tough drive operations,0,times
+41,Unit power consumption,10,W
+42,Unit total power consumption,0,Wh
+43,Current position,0.000,mm
+44,Command position,0.000,mm
+45,Remaining command distance,0.000,mm
+46,Point table No./Program No.,0,
+47,Step No.,0,
+48,Override voltage,-0.04,10mV
+49,Override level,100,%
+52,Cam axis current value per cycle,0.000,
+53,Cam reference position,0.000,mm
+54,Cam axis feed current value,0.000,mm
+55,Execute cam No.,0,
+56,Execute cam stroke,0.000,mm
+57,Main shaft current value,0.000,
+58,Main shaft current value per cycle,0.000,
+</MonitorData>
+	</ALARM_MONITOR>
+</Root>

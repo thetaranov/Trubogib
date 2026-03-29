@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>02. ПЛК Owen + Энкодер — Трубогиб ЧПУ</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="page-wrapper">
+
+  <nav class="sidebar">
+    <div class="sidebar-logo">
+      <strong>ТРУБОГИБ ЧПУ</strong>
+      <span>Мануал v2.1</span>
+    </div>
+    <div class="sidebar-section">Навигация</div>
+    <a href="index.html">&#127968; Главная</a>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-section">Разделы</div>
+    <a href="01_vfd_delta_cp2000.html">01. Привод VFD (Delta CP2000)</a>
+    <a href="02_plc_owen.html" class="active">02. ПЛК Owen + Энкодер</a>
+    <a href="03_servo_mitsubishi.html">03. Сервоприводы Mitsubishi</a>
+    <a href="04_control_bridge.html">04. Интеграционный слой</a>
+    <a href="05_mechanics.html">05. Кинематика осей</a>
+    <a href="06_software_runtime.html">06. ПО и запуск</a>
+  </nav>
+
+  <div class="main-content">
+    <header>
+      <div class="container">
+        <h1>02. ПЛК Owen PLC110-30 + Энкодер Briter</h1>
+        <div class="subtitle">PLC110-24.30.Р-М [M02]. CoDeSys 2.3.9 ST. Управление осью гибки.</div>
+      </div>
+    </header>
+
+    <div class="container">
+      <nav class="breadcrumb">
+        <a href="index.html">Главная</a> <span>&rsaquo;</span> 02. ПЛК Owen + Энкодер
+      </nav>
+
+      <h2>1. Спецификация ПЛК</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Модель</td><td class="bold mono">Owen PLC110-24.30.Р-М [M02]</td></tr>
+        <tr><td>Напряжение питания</td><td>24 В DC (от внешнего БП 24В/5А)</td></tr>
+        <tr><td>Дискретные входы</td><td>24 шт, 24 В DC, PNP/NPN</td></tr>
+        <tr><td>Дискретные выходы</td><td>30 шт, <strong>релейные</strong> (тип Р), 250 В AC / 5 А</td></tr>
+        <tr><td>Быстрые входы (HSC)</td><td>2 шт — энкодерные (квадратура A/B, 4x)</td></tr>
+        <tr><td>Среда программирования</td><td>CoDeSys v2.3.9</td></tr>
+        <tr><td>Язык программирования</td><td>Structured Text (ST)</td></tr>
+        <tr><td>Связь (RS-485)</td><td>Modbus RTU Master, 38400 8N1</td></tr>
+        <tr><td>Цикл ПЛК</td><td>≈ 10 мс</td></tr>
+        <tr><td>Файл проекта</td><td class="mono">ПЛК/TRUBOGIB_CLEAN.exp</td></tr>
+      </table>
+      </div>
+
+      <h2>2. Энкодер Briter BRT38-P1T-360K-RT1</h2>
+
+      <h3>2.1. Характеристики</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Параметр</th><th>Значение</th></tr>
+        <tr><td>Модель</td><td class="bold mono">BRT38-P1T-360K-RT1</td></tr>
+        <tr><td>Разрешение</td><td><strong>360 P/R</strong> (импульсов на оборот)</td></tr>
+        <tr><td>Тип выхода</td><td>Push-Pull (P1T) — совместим с 24В логикой ПЛК</td></tr>
+        <tr><td>Каналы</td><td>A + B (квадратура 90°)</td></tr>
+        <tr><td>Напряжение питания</td><td>5–24 В DC</td></tr>
+        <tr><td>Корпус</td><td>ø38 мм, круглый фланец (RT1), сквозной вал</td></tr>
+        <tr><td>Подключение</td><td>5 проводов: +V, 0V, A, B, экран</td></tr>
+      </table>
+      </div>
+
+      <h3>2.2. Схема подключения энкодера к ПЛК</h3>
+      <pre><code>Энкодер BRT38                Owen PLC110-30
+─────────────                ─────────────
++V  (красный)  ────────────► +24В (от БП ПЛК)
+0V  (чёрный)   ────────────► 0В GND
+A   (зелёный)  ────────────► Быстрый вход %IX0.0  (HSC канал A)
+B   (белый)    ────────────► Быстрый вход %IX0.1  (HSC канал B)
+Экран          ────────────► Клемма PE (только с одной стороны)</code></pre>
+
+      <div class="alert alert-warn">
+        <strong>Быстрые входы ≠ обычные входы!</strong>
+        Энкодер подключается только к клеммам БЫСТРЫХ входов (%IX0.0 и %IX0.1).
+        Обычные дискретные входы не способны считать импульсы на скорости 1000+ Гц.
+        В CoDeSys: PLC Configuration → Fast Inputs → Channel 0 → Quadrature A/B.
+      </div>
+
+      <h3>2.3. Расчёт угла гибки</h3>
+      <pre><code>Энкодер 360 P/R × 4x квадратура = 1440 отсчётов на оборот вала
+
+В текущей прошивке ПЛК применено упрощение:
+  gCurrentAngle = HSC_value
+  (1 импульс ≈ 1 градус — работает при передаточном числе механики ~4:1)
+
+Если передаточное число другое → пересчитать:
+  Угол (°) = HSC_value × 360 / (360 × 4 × i_механики)</code></pre>
+
+      <h2>3. Карта входов/выходов ПЛК</h2>
+
+      <h3>Быстрые входы (энкодер)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Адрес CoDeSys</th><th>Клемма</th><th>Сигнал</th><th>Примечание</th></tr>
+        <tr class="key-row">
+          <td class="mono">%IX0.0</td><td>HSC A</td><td>Энкодер A</td><td>Квадратура — канал A (4x)</td>
+        </tr>
+        <tr class="key-row">
+          <td class="mono">%IX0.1</td><td>HSC B</td><td>Энкодер B</td><td>Квадратура — канал B (4x)</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>Дискретные входы</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Адрес CoDeSys</th><th>Клемма</th><th>Сигнал</th><th>Примечание</th></tr>
+        <tr class="key-row">
+          <td class="mono">%IX1.4</td><td>D5</td><td>Переключатель режима</td><td>OFF = ручной, ON = авто</td>
+        </tr>
+        <tr class="key-row">
+          <td class="mono">%IX1.5</td><td>D7</td><td>Педаль вперёд (гибка +)</td><td>Гибочный ролик вперёд</td>
+        </tr>
+        <tr class="key-row">
+          <td class="mono">%IX1.6</td><td>D8</td><td>Педаль назад (гибка −)</td><td>Возврат гибочного ролика</td>
+        </tr>
+      </table>
+      </div>
+
+      <h3>Дискретные выходы (релейные)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Адрес CoDeSys</th><th>Клемма</th><th>Сигнал</th><th>Подключение</th></tr>
+        <tr class="key-row">
+          <td class="mono">%QX3.0.0</td><td>DO10</td><td>Мотор вперёд</td><td>Реле → VFD клемма FWD (гибка вперёд)</td>
+        </tr>
+        <tr class="key-row">
+          <td class="mono">%QX3.0.1</td><td>DO11</td><td>Мотор назад</td><td>Реле → VFD клемма REV (возврат ролика)</td>
+        </tr>
+        <tr>
+          <td class="mono">%QX3.0.4</td><td>DO9</td><td>SON пара 1 (Z)</td><td>Servo ON ось Z — синий провод CN1</td>
+        </tr>
+        <tr>
+          <td class="mono">%QX3.0.7</td><td>DO12</td><td>SON пара 2 (C)</td><td>Servo ON ось C — синий провод CN1</td>
+        </tr>
+      </table>
+      </div>
+
+      <h2>4. Глобальные переменные (GVL)</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Переменная</th><th>Тип</th><th>RETAIN</th><th>Описание</th></tr>
+        <tr><td class="mono">gCurrentAngle</td><td>INT</td><td>✓</td><td>Текущий угол гибки (°), 1 импульс ≈ 1°</td></tr>
+        <tr><td class="mono">gTargetAngle</td><td>INT</td><td>✓</td><td>Целевой угол для автоматического режима</td></tr>
+        <tr><td class="mono">gDefaultTarget</td><td>INT</td><td>✓</td><td>Угол по умолчанию при старте цикла 1</td></tr>
+        <tr><td class="mono">gCycleNum</td><td>INT</td><td>✓</td><td>Цикл: 1 = гибка вперёд, 2 = возврат в 0</td></tr>
+        <tr><td class="mono">gMode</td><td>BOOL</td><td>✗</td><td>Режим: FALSE = ручной, TRUE = авто</td></tr>
+        <tr><td class="mono">gDone</td><td>BOOL</td><td>✗</td><td>Признак: цель достигнута</td></tr>
+        <tr><td class="mono">gBeeper</td><td>BOOL</td><td>✗</td><td>Управление бипером (%QX5.0)</td></tr>
+        <tr><td class="mono">sonZ</td><td>BOOL</td><td>✗</td><td>SON пара 1 (ось Z) → DO9</td></tr>
+        <tr><td class="mono">sonC</td><td>BOOL</td><td>✗</td><td>SON пара 2 (ось C) → DO12</td></tr>
+        <tr><td class="mono">gHostCommand</td><td>INT</td><td>✗</td><td>Команда от Teensy: 0=нет, 1=обнулить угол</td></tr>
+        <tr><td class="mono">gTargetAngle</td><td>INT</td><td>✗</td><td>Целевой угол, заданный через EXE интерфейс</td></tr>
+      </table>
+      </div>
+
+      <h2>5. Алгоритм работы (PLC_PRG)</h2>
+      <pre><code>Каждый цикл ПЛК (~10 мс):
+
+[1] Чтение входов:
+    gMode         ← %IX1.4
+    pedalFwd      ← %IX1.5
+    pedalRev      ← %IX1.6
+    gCurrentAngle ← HSC_value
+
+[2] Обработка Modbus-команд от ESP/Teensy:
+    IF gHostCommand = 1 → HSC_value := 0; gCurrentAngle := 0; gHostCommand := 0
+    IF gWebTarget > 0  → gTargetAngle := gWebTarget; gWebTarget := 0
+
+[3] Ручной режим (gMode = FALSE):
+    pedalFwd → DO10 (мотор+)
+    pedalRev → DO11 (мотор−)
+    Блокировка: DO10 и DO11 никогда не активны одновременно
+
+[4] Автоматический режим (gMode = TRUE):
+    Цикл 1 (гибка вперёд):
+      Педаль D7 управляет DO10
+      IF gCurrentAngle >= gTargetAngle → gDone:=TRUE, beeper 500мс, gCycleNum:=2
+
+    Цикл 2 (возврат):
+      Педаль D8 управляет DO11
+      IF gCurrentAngle <= 0 → gDone:=TRUE, beeper 500мс, gCycleNum:=1
+
+[5] Запись Modbus-регистров (FC 0x10, каждые 100 мс):
+    HR[0]←gCurrentAngle, HR[1]←gTargetAngle, HR[2]←gCycleNum,
+    HR[3]←gMode, HR[4]←gDone, HR[5]←pedalFwd, HR[6]←pedalRev
+
+[6] Чтение Modbus-регистров (FC 0x03, каждые 100 мс):
+    HR[9]→gHostCommand, HR[10]→gTargetAngle</code></pre>
+
+      <h2>6. Карта регистров Modbus RTU</h2>
+
+      <p>ПЛК — Modbus Master. ESP8266/Teensy — Modbus Slave (адрес 1). Скорость 38400 8N1, RS-485.</p>
+
+      <h3>Запись ПЛК → Slave (FC 0x10, регистры 0–6)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>HR №</th><th>Переменная ПЛК</th><th>Тип</th><th>Описание</th></tr>
+        <tr class="key-row"><td>0</td><td class="mono">gCurrentAngle</td><td>INT16</td><td><strong>Текущий угол гибки (°)</strong></td></tr>
+        <tr><td>1</td><td class="mono">gTargetAngle</td><td>INT16</td><td>Целевой угол (°)</td></tr>
+        <tr><td>2</td><td class="mono">gCycleNum</td><td>INT16</td><td>Цикл: 1=вперёд, 2=назад</td></tr>
+        <tr><td>3</td><td class="mono">gMode</td><td>INT16</td><td>0=ручной, 1=авто</td></tr>
+        <tr><td>4</td><td class="mono">gDone</td><td>INT16</td><td>0=в процессе, 1=готово</td></tr>
+        <tr><td>5</td><td class="mono">gPedalFwd</td><td>INT16</td><td>Педаль D7: 0/1</td></tr>
+        <tr><td>6</td><td class="mono">gPedalRev</td><td>INT16</td><td>Педаль D8: 0/1</td></tr>
+      </table>
+      </div>
+
+      <h3>Чтение ПЛК ← Slave (FC 0x03, регистры 9–10)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>HR №</th><th>Переменная</th><th>Тип</th><th>Описание</th></tr>
+        <tr class="key-row"><td>9</td><td class="mono">gHostCommand</td><td>INT16</td><td>0=нет команды, <strong>1=обнулить угол</strong></td></tr>
+        <tr class="key-row"><td>10</td><td class="mono">gTargetAngle</td><td>INT16</td><td>Целевой угол из интерфейса (°)</td></tr>
+      </table>
+      </div>
+
+      <h3>Расширенная карта (интеграционный этап)</h3>
+      <div class="table-wrap">
+      <table>
+        <tr><th>HR №</th><th>Имя</th><th>Напр.</th><th>Описание</th></tr>
+        <tr><td>0–6</td><td>см. выше</td><td>ПЛК→ESP</td><td>Статус оси гибки</td></tr>
+        <tr class="key-row"><td>3</td><td class="mono">PlcState</td><td>ПЛК→ESP</td><td><strong>0=Idle, 1=Bending, 2=Returning, 3=Done, 4=Error</strong></td></tr>
+        <tr><td>8</td><td class="mono">CmdRegister</td><td>ESP→ПЛК</td><td>0=нет, 1=Start, 2=Stop, 3=Home, 4=E-Stop</td></tr>
+        <tr class="key-row"><td>9</td><td class="mono">CmdTargetAngle</td><td>ESP→ПЛК</td><td><strong>Целевой угол от EXE (в °)</strong></td></tr>
+        <tr><td>10</td><td class="mono">CmdStepIndex</td><td>ESP→ПЛК</td><td>Номер текущего шага программы</td></tr>
+      </table>
+      </div>
+
+      <h2>7. Настройка Modbus в CoDeSys 2.3.9</h2>
+      <pre><code>Инструменты → PLC Configuration:
+  RS-485 COM1:
+    Baudrate: 38400
+    Parity:   None
+    Stop bits: 1
+    Data bits: 8
+
+  Modbus Master:
+    Slave Address: 1
+    Poll Rate: 100 ms
+    Timeout: 500 ms
+
+    Channel 1 — Write (FC 0x10):
+      Start Reg: 0,  Count: 7
+      Variables: gCurrentAngle, gTargetAngle, gCycleNum,
+                 gMode, gDone, gPedalFwd, gPedalRev
+
+    Channel 2 — Read (FC 0x03):
+      Start Reg: 9,  Count: 2
+      Variables: gHostCommand, gTargetAngle</code></pre>
+
+      <h2>8. Загрузка программы в ПЛК — пошаговая инструкция</h2>
+      <div class="steps">
+        <ol>
+          <li>Установить CoDeSys v2.3.9 (с сайта овен.рф). Скопировать папку <code>PLC110.30_m_v2/</code> в директорию таргетов CoDeSys. Запустить <code>InstallTarget.bat</code>.</li>
+          <li>Файл → Новый → Target: <strong>PLC110-30 [M02]</strong> → Язык: <strong>Structured Text (ST)</strong>.</li>
+          <li>Проект → Импорт → выбрать <code>ПЛК/TRUBOGIB_CLEAN.exp</code>.</li>
+          <li><strong>ВАЖНО (двухпанельный редактор):</strong> Строки <code>VAR...END_VAR</code> вставить в <em>верхнюю панель</em>, код программы — в нижнюю панель.</li>
+          <li>PLC Configuration → Fast Inputs → Channel 0: Mode = Quadrature A/B (4x). Привязать <code>%IX0.0</code>, <code>%IX0.1</code>.</li>
+          <li>Discrete Inputs → привязать <code>%IX1.4</code>, <code>%IX1.5</code>, <code>%IX1.6</code>.</li>
+          <li>Discrete Outputs → привязать <code>%QX3.0.0</code>, <code>%QX3.0.1</code>, <code>%QX3.0.2</code>.</li>
+          <li>Проект → Перестроить всё <strong>(Ctrl+F11)</strong>. Устранить все ошибки.</li>
+          <li>Подключить USB (или Ethernet). Онлайн → Параметры связи → Выбрать порт.</li>
+          <li>Онлайн → Загрузить. Онлайн → Старт (F5). Убедиться в зелёном индикаторе работы.</li>
+        </ol>
+      </div>
+
+      <h2>9. Калибровка (обнуление угла)</h2>
+      <p>Перед первым гибом ролик должен стоять в 0°. Затем — обнулить счётчик энкодера:</p>
+      <ul>
+        <li><strong>Через десктопное приложение (EXE):</strong> кнопка «ОБНУЛИТЬ».</li>
+        <li><strong>Из CoDeSys (Watch):</strong> в окне Watch добавить <code>gCurrentAngle</code>, вручную установить 0.</li>
+      </ul>
+
+      <h2>10. Типичные ошибки CoDeSys</h2>
+      <div class="table-wrap">
+      <table>
+        <tr><th>Ошибка</th><th>Причина</th><th>Решение</th></tr>
+        <tr><td class="mono">C0001: Identifier not declared</td><td>Переменная не объявлена</td><td>Добавить в <code>VAR...END_VAR</code> верхней панели</td></tr>
+        <tr><td class="mono">C0032: Type mismatch</td><td>INT vs BOOL</td><td><code>INT_TO_BOOL(x)</code> / <code>BOOL_TO_INT(x)</code></td></tr>
+        <tr><td>HSC не считает</td><td>Не настроены быстрые входы</td><td>PLC Configuration → Fast Inputs → Quadrature A/B</td></tr>
+        <tr><td>Modbus нет связи</td><td>Неверный COM или A/B перепутаны</td><td>38400 8N1, поменять A↔B на разъёме RS-485</td></tr>
+        <tr><td>RETAIN не сохраняется</td><td>Переменная без ключа RETAIN</td><td>Объявить как <code>VAR RETAIN</code></td></tr>
+      </table>
+      </div>
+
+      <footer>Трубогиб ЧПУ — Мануал v2.1 | Март 2026</footer>
+    </div>
+  </div>
+</div>
+</body>
+</html>
