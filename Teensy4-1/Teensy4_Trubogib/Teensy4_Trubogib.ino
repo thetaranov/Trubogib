@@ -1,847 +1,1565 @@
 /*
- * Teensy4_Trubogib.ino — Прошивка Teensy 4.1, контроллер движения трубогиба v2.0
- *
- * Архитектура:
- *   EXE TubeBender ──USB-Serial──► Teensy 4.1 ──Step/Dir──► MR-JE-200A (×2)
- *                                      │
- *                               RS-485 Modbus RTU
- *                                      │
- *                               Owen PLC110-30 (Master)
- *
- * Teensy = Modbus Slave (ID=1, 115200 8N1)
- * ПЛК = Modbus Master (пишет рег.0-6 по FC 0x10, читает рег.9-10 по FC 0x03)
- *
- * Пины макетной платы (4× MAX490 + 1× MAX485):
- *   0 (RX1)  — MAX485 RO (через делитель 1кОм+2кОм, 5V→3.3V)
- *   1 (TX1)  — MAX485 DI
- *   24       — MAX485 DE+RE
- *   2        — Step Z  (MAX490 #1 DI → Y/Z → CN1 PP/PG серво Z)
- *   3        — Dir Z   (MAX490 #2 DI → Y/Z → CN1 NP/NG серво Z)
- *   4        — Step C  (MAX490 #3 DI → Y/Z → CN1 PP/PG серво C)
- *   5        — Dir C   (MAX490 #4 DI → Y/Z → CN1 NP/NG серво C)
- *   6        — ЗАПАС   (SON Z теперь через ПЛК DO7 → синий провод CN1 pin 15)
- *   7        — ЗАПАС   (SON C теперь через ПЛК DO8 → синий провод CN1 pin 15)
- *   8        — ЗАПАС   (Home Z — при необходимости)
- *   9        — ЗАПАС   (Home C — при необходимости)
- *
- * Механика:
- *   Серво: MR-JE-200A + HG-SN152J-S100 (1.5 кВт), Pr.PA13=0011
- *   10000 имп/об (заводская настройка MR-JE-A)
- *   Ось Z: PF115L1-008 (i=1:8), шестерня M2 Z35 (d_дел=70мм) + рейка M2
- *          80000 имп/оборот вых. вала, π×70 мм/оборот → 363.78 шаг/мм
- *   Ось C: PF115L2-020 (i=1:20), Z35→Z105 (3:1), итого 60:1
- *          600000 имп/оборот патрона, 360° → 1666.67 шаг/°
+ * Teensy4_Trubogib.ino — PLC-free runtime for TubeBender
+ * v4.3: unified status JSON for EXE + encoder/pedal/SON telemetry + I2C LCD
  */
 
-/* ======================== КОНФИГУРАЦИЯ ======================== */
+#include <Arduino.h>
+#include <Wire.h>
+#include <EEPROM.h>
+#include <LiquidCrystal_I2C.h>
+#include "ModbusRTU.h"
 
-#define FW_VERSION "2.1"
+// I2C LCD address is typically 0x27 for PCF8574T
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-/* -- Modbus -- */
-#define MODBUS_BAUD       115200
-#define MODBUS_ADDR       1
-#define RS485_DE          24        /* DE+RE MAX485 */
+// ═════════════════════════════════════════════════════════════════════
+// LCD_SCENARIOS — Display scenarios for 16x2 LCD (embedded)
+// ═════════════════════════════════════════════════════════════════════
+class LCDScenarios {
+public:
+    enum State {
+        STATE_IDLE = 0,
+        STATE_FEED = 1,
+        STATE_ROTATION = 2,
+        STATE_BENDING = 3,
+        STATE_CLAMP_CLOSE = 4,
+        STATE_CLAMP_OPEN = 5,
+        STATE_ERROR = 6,
+        STATE_CONNECTION = 7,
+        STATE_DIAGNOSTICS = 8,
+        STATE_HOMING = 9,
+        STATE_CALIBRATION = 10
+    };
 
-/* -- Step/Dir -- */
+    struct DisplayData {
+        double currentZ_mm = 0.0;
+        double targetZ_mm = 0.0;
+        double currentC_deg = 0.0;
+        double targetC_deg = 0.0;
+        int currentBend_deg = 0;
+        int targetBend_deg = 0;
+        int currentStep = 0;
+        int totalSteps = 0;
+        State currentState = STATE_IDLE;
+        uint32_t loopHz = 0;
+        uint32_t stepHz = 0;
+        bool isConnected = false;
+        bool servoOn = false;
+        bool limitZMinActive = false;
+        bool limitZMaxActive = false;
+        uint16_t errorCode = 0;
+    };
+
+    static void displayIdle(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[17];
+        snprintf(line1, sizeof(line1), "C:%.1f%c", data.currentC_deg, '\xDF');
+        snprintf(line2, sizeof(line2), "Z:%.1f%c Ready", data.currentZ_mm, 'm');
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayFeed(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[25], line2[17];
+        if (data.totalSteps > 0)
+            snprintf(line1, sizeof(line1), "S %d/%d PODACHA", data.currentStep, data.totalSteps);
+        else
+            snprintf(line1, sizeof(line1), "PODACHA KapeTka");
+        snprintf(line2, sizeof(line2), "%.1f/%.1f%c", data.currentZ_mm, data.targetZ_mm, 'm');
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayRotation(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[25], line2[17];
+        if (data.totalSteps > 0)
+            snprintf(line1, sizeof(line1), "S %d/%d ROTACIA", data.currentStep, data.totalSteps);
+        else
+            snprintf(line1, sizeof(line1), "ROTACIA Tuba");
+        snprintf(line2, sizeof(line2), "%.0f%c/%.0f%c", data.currentC_deg, '\xDF', data.targetC_deg, '\xDF');
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayBending(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[25], line2[17];
+        if (data.totalSteps > 0)
+            snprintf(line1, sizeof(line1), "S %d/%d GIBKA", data.currentStep, data.totalSteps);
+        else
+            snprintf(line1, sizeof(line1), "GIBKA Rolik");
+        snprintf(line2, sizeof(line2), "%d%c/%d%c", data.currentBend_deg, '\xDF', data.targetBend_deg, '\xDF');
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayClampClose(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[20];
+        snprintf(line1, sizeof(line1), "S %d/%d PRIZHIM", data.currentStep, data.totalSteps);
+        strncpy(line2, "████░░░░░░░░░░", sizeof(line2)-1);
+        line2[sizeof(line2)-1] = 0;
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayClampOpen(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[20];
+        snprintf(line1, sizeof(line1), "S %d/%d RAZZHIM", data.currentStep, data.totalSteps);
+        strncpy(line2, "░░░░░░░░████░░░░", sizeof(line2)-1);
+        line2[sizeof(line2)-1] = 0;
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayError(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[17];
+        snprintf(line1, sizeof(line1), "!! OSHIBKA !!");
+        if (data.limitZMinActive)
+            snprintf(line2, sizeof(line2), "Limit KapeTka-");
+        else if (data.limitZMaxActive)
+            snprintf(line2, sizeof(line2), "Limit KapeTka+");
+        else
+            snprintf(line2, sizeof(line2), "ERR: 0x%04X", data.errorCode);
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayConnection(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[17];
+        if (data.isConnected) {
+            snprintf(line1, sizeof(line1), "CONNECTED");
+            snprintf(line2, sizeof(line2), "v4.21 Ready");
+        } else {
+            snprintf(line1, sizeof(line1), "WAITING...");
+            snprintf(line2, sizeof(line2), "Connect EXE");
+        }
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayDiagnostics(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[17];
+        snprintf(line1, sizeof(line1), "DIAG %luHz", data.stepHz);
+        snprintf(line2, sizeof(line2), "Loop %luHz", data.loopHz);
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayHoming(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[20];
+        snprintf(line1, sizeof(line1), "HOME KapeTka");
+        strncpy(line2, "████░░░░░░░░░░", sizeof(line2)-1);
+        line2[sizeof(line2)-1] = 0;
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void displayCalibration(LiquidCrystal_I2C& lcd, const DisplayData& data) {
+        char line1[17], line2[17];
+        snprintf(line1, sizeof(line1), "KALIBR");
+        snprintf(line2, sizeof(line2), "Z:%.1f C:%.0f%c", data.currentZ_mm, data.currentC_deg, '\xDF');
+        lcd.setCursor(0, 0); lcd.print(line1);
+        lcd.setCursor(0, 1); lcd.print(line2);
+    }
+
+    static void update(LiquidCrystal_I2C& lcd, const DisplayData& data, State state) {
+        switch (state) {
+            case STATE_IDLE: displayIdle(lcd, data); break;
+            case STATE_FEED: displayFeed(lcd, data); break;
+            case STATE_ROTATION: displayRotation(lcd, data); break;
+            case STATE_BENDING: displayBending(lcd, data); break;
+            case STATE_CLAMP_CLOSE: displayClampClose(lcd, data); break;
+            case STATE_CLAMP_OPEN: displayClampOpen(lcd, data); break;
+            case STATE_ERROR: displayError(lcd, data); break;
+            case STATE_CONNECTION: displayConnection(lcd, data); break;
+            case STATE_DIAGNOSTICS: displayDiagnostics(lcd, data); break;
+            case STATE_HOMING: displayHoming(lcd, data); break;
+            case STATE_CALIBRATION: displayCalibration(lcd, data); break;
+            default: displayIdle(lcd, data);
+        }
+    }
+};
+
+// ── LCD SCENARIOS ──
+LCDScenarios::DisplayData lcdData;
+LCDScenarios::State currentLCDState = LCDScenarios::STATE_IDLE;
+
+#define FW_VERSION        "4.21"
+
+// Production mode: SON commands toggle physical outputs.
+#define SON_DRYRUN        0
+
+// RS-485 Modbus -> VFD
+#define RS485_DE          24
+#define VFD_BAUD          9600
+
+// Motion outputs (kept for compatibility)
 #define PIN_STEP_Z        2
 #define PIN_DIR_Z         3
 #define PIN_STEP_C        4
 #define PIN_DIR_C         5
-/* Пины 6-9: ЗАПАС (SON теперь через ПЛК DO7/DO8, Home — при необходимости) */
-// #define PIN_SON_Z      6         /* запас */
-// #define PIN_SON_C      7         /* запас */
-// #define PIN_HOME_Z     8         /* запас */
-// #define PIN_HOME_C     9         /* запас */
 
-/* -- Безопасность -- */
-#define WD_TIMEOUT_MS     2000      /* >2 с без Modbus → E-Stop */
-#define DEBOUNCE_MS       20        /* антидребезг Home */
+// Bend encoder via PC817
+#define PIN_ENC_BEND_A    6
+#define PIN_ENC_BEND_B    7
 
-/* -- Доставка Ext CMD в ПЛК -- */
-#define EXT_CMD_PREZERO_MS      120   /* для edge-команд (START/STOP/ZERO/AUTO) */
-#define EXT_CMD_HOLD_MS         450
-#define EXT_CMD_POSTZERO_MS     250
-#define EXT_CMD_FAST_HOLD_MS    350   /* для level-команд SON/E-STOP */
-#define EXT_CMD_FAST_POSTZERO_MS 300
+// Servo feedback encoder inputs
+#define PIN_ENC_Z_A       10
+#define PIN_ENC_Z_B       11
+#define PIN_ENC_C_A       12
+#define PIN_ENC_C_B       13
 
-/* -- Движение -- */
-#define FREQ_MIN          500.0f    /* Гц, стартовая/финальная частота */
-#define FREQ_MAX_Z        100000.0f /* Гц, макс. Step Z */
-#define FREQ_MAX_C        50000.0f  /* Гц, макс. Step C */
-#define ACCEL_HZ_S_Z      200000.0f /* Гц/с, ускорение Z */
-#define ACCEL_HZ_S_C      100000.0f /* Гц/с, ускорение C */
-#define HOME_FREQ         2000.0f   /* Гц, грубый поиск Home */
-#define HOME_FREQ_SLOW    500.0f    /* Гц, точный подход */
-#define HOME_BACKOFF      500       /* шагов отъезда от датчика */
-#define PULSE_US          2         /* мкс, ширина импульса Step */
-#define MIN_INTERVAL_US   7         /* мкс, мин. период таймера */
+// Inputs via PC817 (active LOW)
+#define PIN_PEDAL_FWD     27
+#define PIN_PEDAL_REV     28
+#define PIN_MODE_SW       29
+#define PIN_LIM_Z_MIN     31
+#define PIN_LIM_Z_MAX     32
 
-/* -- Механика -- */
-#define STEPS_MM_Z        363.78f   /* шаг/мм  (10000×8 / (π×70)) */
-#define STEPS_DEG_C       1666.67f  /* шаг/°   (10000×60 / 360) */
+// Outputs via XY-MOS
+#define PIN_SON_Z         33
+#define PIN_SON_C         34
 
-/* ======================== КАРТА РЕГИСТРОВ MODBUS ======================== */
+// Pneumatic cylinder control (separate pins for CLAMP/UNCLAMP)
+// JQC-3FF-S-Z 5V relay (ACTIVE LOW logic)
+#define PIN_CLAMP         35  // LOW = close/press (active LOW!)
+#define PIN_UNCLAMP       36  // LOW = open/release (active LOW!)
 
-/*  Регистры 0-6: ПЛК → Teensy (FC 0x10, запись каждые 100 мс) */
-#define R_CUR_ANGLE       0   /* gCurrentAngle — текущий угол гибки (°) */
-#define R_TGT_ANGLE       1   /* gTargetAngle  — целевой угол (°) */
-#define R_CYCLE           2   /* gCycleNum     — номер цикла (1/2) */
-#define R_MODE            3   /* gMode         — 0=ручной, 1=авто */
-#define R_DONE            4   /* gDone         — цель достигнута 0/1 */
-#define R_PEDAL_FWD       5   /* gPedalFwd     — педаль вперёд 0/1 */
-#define R_PEDAL_REV       6   /* gPedalRev     — педаль назад 0/1 */
-#define R_ALARMS          7   /* Feedback from PLC: b0=almZ,b1=almC,b2=DO7,b3=DO8,b4=DO9,b5=DO12 */
+// ─────────────────────────────────────────────────────────────────────
+// Unified 1:1 scale (EXE ↔ Teensy ↔ Servo). The gearbox lives HERE, in
+// Teensy only. EXE speaks mm/deg/s only; servo electronic gear is 1:1
+// (PA06=PA07=1), so 1 command pulse = 1 increment of PA05 "FBP" at the
+// servo amp, i.e. 10000 command pulses = 1 motor rev.
+//
+// Two DIFFERENT scales are used:
+//   • *_CMD_TICKS_PER_*  — pulses Teensy SENDS (step out). Derived from
+//                           PA05 = 10000 cmd pulses per motor rev.
+//   • *_FB_TICKS_PER_*   — ticks Teensy DECODES from LA/LB output
+//                           (x4 of PA15 = 16000 ticks per motor rev).
+//
+// Mechanics:
+//   Z: rack M2, Z35, gearbox 1:8 → 27.49 mm per motor rev
+//   C: Z35/Z105 × 1:20 → i=60:1, 6° output per motor rev
+// ─────────────────────────────────────────────────────────────────────
+// MR-JE-A (Z/C axes) — command side:
+//   PA05 FBP = 10000 (command pulses/rev), PA06=1, PA07=1 (electronic gear 1:1)
+// Feedback side (PA15 ENR encoder output pulses/rev, ×4 after quadrature):
+//   This constant is CALIBRATED EMPIRICALLY via hand-rotation test:
+//     1 pinion revolution = 8 motor revs = Z_MM_PER_REV × 8 = 219.92 mm.
+//   Measurement 2026-04-16 with fixed main-loop (no VFD 100 ms blocks, LCD 500 ms):
+//     hand-rotation 1 pinion rev → 901 mm displayed at ENC_X4=964
+//     → capture was 98.7 % of 32 000 physical ticks → PA15 = 1000 in drive.
+//   Setting ENC_X4 = PA15 × 4 = 4000 makes the display read the true 220 mm.
+// IF YOU CHANGE PA15 IN THE DRIVE: recompute ENC_X4 = new_PA15 × 4 and rerun the
+// hand-rotation test. Polled-tick count per 1 pinion rev appears in the log as
+// the difference in gZfbTicks — divide by 8 to get PA15.
+#define ENC_X4               946.0          // EMPIRICALLY CALIBRATED: hand-rotation 1 full Z35 rev shows 220mm, was showing 6.51mm → scale factor 220/6.51 = 33.8
+#define SERVO_CMD_PULSES_REV 10000.0        // PA05 command base
+#define Z_MM_PER_REV         27.49          // M2 Z35 pinion (π×70=219.91 mm) ÷ 1:8 reducer
+#define C_DEG_PER_REV        (360.0 / 60.0) // 1:60 total reduction → 6°/motor rev
 
-/*  Регистры 8-10: Teensy → ПЛК (FC 0x03, чтение каждые 100 мс)
- *  Совместимость:
- *    - старые проекты ПЛК: gExtCommand в рег.8
- *    - актуальный TRUBOGIB_CLEAN.exp: gExtCommand в рег.9, gExtTarget в рег.10
- */
-#define R_EXT_CMD_COMPAT  8   /* compat: gExtCommand (legacy map 0..9) */
-#define R_EXT_CMD         9   /* gExtCommand (actual PLC map) */
-#define R_EXT_TGT         10  /* gExtTarget  (actual PLC map) */
+// Command side (Teensy → servo step/dir)
+#define Z_CMD_TICKS_PER_MM   (SERVO_CMD_PULSES_REV / Z_MM_PER_REV)   // ≈ 363.77
+#define C_CMD_TICKS_PER_DEG  (SERVO_CMD_PULSES_REV / C_DEG_PER_REV)  // ≈ 1666.67
 
-/*  Регистры 11-20: EXE ↔ Teensy (управление осями) */
-#define R_AXIS_CMD        11  /* Команда: 1=homeZ,2=homeC,3=moveZ,4=moveC,5=stop,6=SON on,7=SON off,10=E-Stop */
-#define R_Z_TGT           12  /* Цель Z (мм, int16) */
-#define R_Z_SPD           13  /* Скорость Z (мм/с) */
-#define R_C_TGT           14  /* Цель C (°×10, int16) */
-#define R_C_SPD           15  /* Скорость C (°/с) */
-#define R_Z_POS           16  /* Позиция Z (мм, r/o) */
-#define R_Z_ST            17  /* Статус Z (r/o) */
-#define R_C_POS           18  /* Позиция C (°×10, r/o) */
-#define R_C_ST            19  /* Статус C (r/o) */
-#define R_FLAGS           20  /* Флаги (r/o): b0=SON_Z,b1=SON_C,b2=homeZ,b3=homeC,b4=linkOK */
+// Feedback side
+#define Z_FB_TICKS_PER_MM    (ENC_X4 / Z_MM_PER_REV)                 // ≈ 34.4 (946 / 27.49) - CALIBRATED
+#define C_FB_TICKS_PER_DEG   (ENC_X4 / C_DEG_PER_REV)                // ≈ 157.67
 
-#define NUM_REGS          32
-uint16_t regs[NUM_REGS];
+// Scale factor between feedback ticks and command pulses (10000/946 = 10.57).
+#define CMD_PER_FB           (SERVO_CMD_PULSES_REV / ENC_X4)         // = 10.57
 
-/* ======================== ТИПЫ ======================== */
+// Simplified runtime state
+volatile long gBendTicks = 0;
+volatile long gZfbTicks = 0;
+volatile long gCfbTicks = 0;
+long gBendTicksLast = 0;
+int gBendTargetDeg = 0;
+int gBendCycle = 1;
+bool gBendDone = false;
+int gBendingState = 0;
+bool gClampClosed = false; // State of clamp (true = closed, false = open)
+bool gVfdRunning = false;
+bool gVfdForward = true;
+uint16_t gVfdFreqHz100 = 0;
 
-enum State : uint8_t { ST_IDLE=0, ST_MOVING=1, ST_DONE=2, ST_ERROR=3, ST_HOMING=4 };
-enum HPhase : uint8_t { HP_NONE=0, HP_SEEK=1, HP_BACK=2, HP_REFINE=3 };
+// VFD Modbus control variables
+ModbusRTU* gVfdModbus = nullptr;
+bool gVfdSimulationMode = false;      // When true, simulate VFD instead of real communication
+float gVfdSimFreq = 0.0;              // Simulated frequency (Hz)
+uint16_t gVfdTargetFreqCode = 0;      // Target frequency in 0.01Hz units (0-6000 = 0-60Hz)
+uint16_t gVfdControlWord = 0;         // Control word: bit 0=RUN, bit 1=FWD(0)/REV(1)
+uint32_t gVfdLastUpdateMs = 0;
+uint16_t gVfdCurrentFreqCode = 0;     // Feedback: current frequency (0.01Hz units)
+uint16_t gVfdCurrentCurrent = 0;      // Feedback: current in 0.1A units
+bool gVfdStatusValid = false;
+uint32_t gVfdPollLastMs = 0;
 
-struct Axis {
-  uint8_t pStep, pDir, pSon, pHome;
-  float spu;            /* steps per unit (mm или °) */
-  float fMax, acc;      /* макс. частота, ускорение */
+double gZmm = 0.0;
+double gCdeg = 0.0;
+int gZst = 0; // 0 idle
+int gCst = 0;
 
-  volatile long pos;    /* текущая позиция (шаги) */
-  long tgt;             /* целевая позиция (шаги) */
+unsigned long gMbRx = 0;
+unsigned long gMbTx = 0;
+unsigned long gMbErr = 0;
+unsigned long gMbLink = 0;
+unsigned long gResetCause = 0;
 
-  /* профиль движения */
-  volatile float freq;  /* текущая частота (Гц) */
-  float freqTgt;        /* целевая частота */
-  volatile long decelN; /* кол-во шагов разгона = кол-во шагов торможения */
-  volatile long done;   /* шагов сделано */
-  long total;           /* всего шагов в текущем движении */
-  int8_t dir;           /* +1 / -1 */
+String gRxLine;
 
-  volatile State  st;
-  volatile HPhase hp;
-  volatile long   backTgt; /* цель отъезда при Home */
-  bool son;                /* Servo ON */
+// Diagnostics counters
+volatile uint32_t gStepIsrCount = 0;
+volatile uint32_t gBendIsrCount = 0;
+volatile uint32_t gZfbIsrCount = 0;
+volatile uint32_t gCfbIsrCount = 0;
+uint32_t gDiagStepHz = 0;
+uint32_t gDiagBendHz = 0;
+uint32_t gDiagZfbHz = 0;
+uint32_t gDiagCfbHz = 0;
+uint32_t gDiagLoopHz = 0;
+uint32_t gDiagLoopMaxUs = 0;
+uint32_t gDiagRxCharsPerSec = 0;
+uint32_t gDiagRxOverflowPerSec = 0;
+uint32_t gRxCharsAcc = 0;
+uint32_t gRxOverflowAcc = 0;
 
-  /* debounce Home */
-  unsigned long dbT;
-  bool dbRaw, sensor;
+// ─────────────────────────────────────────────────────────────────────
+//  Калибровка осей: персистентное хранение в EEPROM Teensy 4.1.
+//  При включении читаем сохранённые тики энкодеров и восстанавливаем.
+//  При получении CAL/BZ от EXE — обновляем и сохраняем.
+// ─────────────────────────────────────────────────────────────────────
+struct CalibPersist {
+  uint32_t magic;        // 0xCA1B4242
+  long     bendTicks;
+  long     zFbTicks;
+  long     cFbTicks;
+  uint32_t crc;          // simple XOR sum
 };
+static const uint32_t CALIB_MAGIC = 0xCA1B4242UL;
+static const int      CALIB_ADDR  = 0;
 
-Axis az, ac;
-IntervalTimer tmZ, tmC;
+static uint32_t calibCrc(const CalibPersist& c) {
+  uint32_t s = 0;
+  s ^= c.magic;
+  s ^= (uint32_t)c.bendTicks;
+  s ^= (uint32_t)c.zFbTicks;
+  s ^= (uint32_t)c.cFbTicks;
+  return s ^ 0xA5A5A5A5UL;
+}
 
-/* ======================== ГЛОБАЛЬНЫЕ ======================== */
+void saveCalibration() {
+  CalibPersist c;
+  c.magic = CALIB_MAGIC;
+  noInterrupts();
+  c.bendTicks = gBendTicks;
+  c.zFbTicks  = gZfbTicks;
+  c.cFbTicks  = gCfbTicks;
+  interrupts();
+  c.crc = calibCrc(c);
+  EEPROM.put(CALIB_ADDR, c);
+}
 
-unsigned long mbOkTime = 0;
-bool wdTrip = false;
-unsigned long mbRx = 0, mbTx = 0, mbErr = 0;
-char usbBuf[128];
-int usbN = 0;
-unsigned long extCmdT = 0, extTgtT = 0;
-uint16_t extCmdPulseVal = 0;
-unsigned long extCmdPulseStart = 0;
-bool extCmdFastMode = false;
+bool loadCalibration() {
+  CalibPersist c;
+  EEPROM.get(CALIB_ADDR, c);
+  if (c.magic != CALIB_MAGIC) return false;
+  if (c.crc != calibCrc(c)) return false;
+  noInterrupts();
+  gBendTicks = c.bendTicks;
+  gZfbTicks  = c.zFbTicks;
+  gCfbTicks  = c.cFbTicks;
+  interrupts();
+  gZmm  = (double)c.zFbTicks / Z_FB_TICKS_PER_MM;
+  gCdeg = (double)c.cFbTicks / C_FB_TICKS_PER_DEG;
+  return true;
+}
 
-/* ======================== CRC16 MODBUS ======================== */
+static inline bool pedalFwdPressed() { return digitalRead(PIN_PEDAL_FWD) == LOW; }
+static inline bool pedalRevPressed() { return digitalRead(PIN_PEDAL_REV) == LOW; }
+static inline bool modeAuto() { return digitalRead(PIN_MODE_SW) == LOW; }
+static inline bool limZMin() { return digitalRead(PIN_LIM_Z_MIN) == LOW; }
+static inline bool limZMax() { return digitalRead(PIN_LIM_Z_MAX) == LOW; }
 
-uint16_t crc16(const uint8_t *buf, int len) {
-  uint16_t crc = 0xFFFF;
-  for (int i = 0; i < len; i++) {
-    crc ^= buf[i];
-    for (int j = 0; j < 8; j++)
-      crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+void isrBendEncoder() {
+  gBendIsrCount++;
+  // Proper X4 quadrature decode using lookup table
+  static uint8_t gBendPrevISR = 0;
+  uint8_t a = digitalReadFast(PIN_ENC_BEND_A) ? 1 : 0;
+  uint8_t b = digitalReadFast(PIN_ENC_BEND_B) ? 1 : 0;
+  uint8_t cur = (a << 1) | b;
+  
+  static const int8_t lut[16] = {
+    0, -1,  1,  0,
+    1,  0,  0, -1,
+   -1,  0,  0,  1,
+    0,  1, -1,  0
+  };
+  int8_t d = lut[(gBendPrevISR << 2) | cur];
+  gBendTicks += d;
+  gBendPrevISR = cur;
+}
+
+void isrZfbEncoder() {
+  gZfbIsrCount++;
+  // Proper X4 quadrature decode using lookup table
+  static uint8_t gZPrevISR = 0;
+  uint8_t a = digitalReadFast(PIN_ENC_Z_A) ? 1 : 0;
+  uint8_t b = digitalReadFast(PIN_ENC_Z_B) ? 1 : 0;
+  uint8_t cur = (a << 1) | b;
+  
+  static const int8_t lut[16] = {
+    0, -1,  1,  0,
+    1,  0,  0, -1,
+   -1,  0,  0,  1,
+    0,  1, -1,  0
+  };
+  int8_t d = lut[(gZPrevISR << 2) | cur];
+  gZfbTicks += d;
+  gZPrevISR = cur;
+}
+
+void isrCfbEncoder() {
+  gCfbIsrCount++;
+  // Proper X4 quadrature decode using lookup table
+  static uint8_t gCPrevISR = 0;
+  uint8_t a = digitalReadFast(PIN_ENC_C_A) ? 1 : 0;
+  uint8_t b = digitalReadFast(PIN_ENC_C_B) ? 1 : 0;
+  uint8_t cur = (a << 1) | b;
+  
+  static const int8_t lut[16] = {
+    0, -1,  1,  0,
+    1,  0,  0, -1,
+   -1,  0,  0,  1,
+    0,  1, -1,  0
+  };
+  int8_t d = lut[(gCPrevISR << 2) | cur];
+  gCfbTicks += d;
+  gCPrevISR = cur;
+}
+
+// Polled quadrature decode for Z/C feedback (no interrupts).
+// This keeps encoder feedback available but avoids ISR storms when SON is enabled.
+static uint8_t gZPrevQ = 0;
+static uint8_t gCPrevQ = 0;
+
+static inline int8_t quadDelta(uint8_t prev, uint8_t cur) {
+  static const int8_t lut[16] = {
+    0, -1,  1,  0,
+    1,  0,  0, -1,
+   -1,  0,  0,  1,
+    0,  1, -1,  0
+  };
+  return lut[(prev << 2) | cur];
+}
+
+void pollFeedbackEncoders() {
+  uint8_t za = digitalReadFast(PIN_ENC_Z_A) ? 1 : 0;
+  uint8_t zb = digitalReadFast(PIN_ENC_Z_B) ? 1 : 0;
+  uint8_t zq = (za << 1) | zb;
+  int8_t dz = quadDelta(gZPrevQ, zq);
+  if (dz != 0) {
+    gZfbTicks += dz;
   }
-  return crc;
+  gZPrevQ = zq;
+
+  uint8_t ca = digitalReadFast(PIN_ENC_C_A) ? 1 : 0;
+  uint8_t cb = digitalReadFast(PIN_ENC_C_B) ? 1 : 0;
+  uint8_t cq = (ca << 1) | cb;
+  int8_t dc = quadDelta(gCPrevQ, cq);
+  if (dc != 0) {
+    gCfbTicks += dc;
+  }
+  gCPrevQ = cq;
 }
 
-/* ======================== RS-485 ======================== */
-
-inline void txEn(bool on) { digitalWriteFast(RS485_DE, on); }
-
-void mbSend(const uint8_t *buf, int len) {
-  txEn(true);
-  delayMicroseconds(50);
-  Serial1.write(buf, len);
-  Serial1.flush();
-  delayMicroseconds(100);
-  txEn(false);
-  mbTx++;
+static inline int bendDegFromTicks(long ticks) {
+  // Bend encoder: 360 PPR simple + quadrature X4 decode = 1440 ticks per revolution
+  // 1440 ticks = 360 degrees, so: 1 degree = 4 ticks
+  // Therefore: degrees = ticks / 4
+  return (int)lround(ticks / 4.0);
 }
 
-/* ======================== MODBUS SLAVE ======================== */
+// ═════════════════════════════════════════════════════════════════════
+// Low-Pass Filter for encoder feedback (eliminates pulsation)
+// ═════════════════════════════════════════════════════════════════════
+#define ENC_FILTER_SAMPLES 16  // Number of samples for moving average
+static double zMmFilterBuffer[ENC_FILTER_SAMPLES] = {0};
+static double cDegFilterBuffer[ENC_FILTER_SAMPLES] = {0};
+static uint8_t zMmFilterIndex = 0;
+static uint8_t cDegFilterIndex = 0;
 
-void mbHandle(const uint8_t *f, int len) {
-  if (len < 4 || f[0] != MODBUS_ADDR) return;
+// Helper: compute moving average (called with new raw value)
+static double updateMovingAverage(double newValue, double* buffer, uint8_t bufLen, uint8_t& idx) {
+  buffer[idx] = newValue;
+  idx = (idx + 1) % bufLen;
+  double sum = 0.0;
+  for (uint8_t i = 0; i < bufLen; i++) {
+    sum += buffer[i];
+  }
+  return sum / bufLen;
+}
 
-  uint16_t cc = crc16(f, len - 2);
-  uint16_t cr = f[len-2] | (f[len-1] << 8);
-  if (cc != cr) { mbErr++; return; }
+// --- Step Generator Variables ---
+IntervalTimer stepTimer;
+bool gStepTimerRunning = false;
+volatile bool gArcActive = false;
+volatile long gArcStartBendTicks = 0;
+volatile double gArcRadius = 0.0;
+volatile long gArcStartZPulse = 0;
+volatile double gArcTargetAngle = 0.0;
 
-  mbRx++;
-  mbOkTime = millis();
-  uint8_t fc = f[1];
+volatile long gZTargetPulse = 0;
+volatile long gZCurrentPulse = 0;
+volatile bool gZStepHigh = false;
+volatile double gZVirtualPulse = 0.0;
+volatile double gZSpeedStep = 0.0;
 
-  if (fc == 0x03 && len == 8) {
-    /* FC 03: Read Holding Registers */
-    uint16_t s = (f[2]<<8)|f[3], n = (f[4]<<8)|f[5];
-    if (s + n > NUM_REGS || n > 32) return;
-    uint8_t r[5 + 64];
-    r[0] = MODBUS_ADDR; r[1] = 0x03; r[2] = n * 2;
-    for (int i = 0; i < n; i++) {
-      r[3+i*2]   = regs[s+i] >> 8;
-      r[3+i*2+1] = regs[s+i] & 0xFF;
+volatile long gCTargetPulse = 0;
+volatile long gCCurrentPulse = 0;
+volatile bool gCStepHigh = false;
+volatile double gCVirtualPulse = 0.0;
+volatile double gCSpeedStep = 0.0;
+
+// Trapezoidal acceleration profile
+#define DEFAULT_Z_ACCEL     250.0   // mm/s²  (ramp ~0.06s at 100mm/s)
+#define DEFAULT_C_ACCEL     100.0   // deg/s² (ramp ~0.05s at 30deg/s)
+#define MIN_Z_SPEED        20.0    // mm/s (start/stop speed) - INCREASED from 2.0
+#define MIN_C_SPEED        1.0    // deg/s
+
+volatile double gZMaxSpeed = 0.0;
+volatile double gZCurSpeed = 0.0;
+volatile double gZAccelRate = 0.0;
+volatile double gZMinSpeed = 0.0;
+
+volatile double gCMaxSpeed = 0.0;
+volatile double gCCurSpeed = 0.0;
+volatile double gCAccelRate = 0.0;
+volatile double gCMinSpeed = 0.0;
+
+// Step info from EXE for LCD display
+volatile int gStepCurrent = 0;
+volatile int gStepTotal = 0;
+
+// Step ISR frequency. Step generator uses a 2-ISR-tick HIGH/LOW cycle, so
+// max pulse rate = STEP_ISR_HZ / 2.
+//   40 kHz ISR →  20 kHz STEP → ~55  mm/s feed (old, too slow)
+//   80 kHz ISR →  40 kHz STEP → ~110 mm/s feed (previous)
+//  200 kHz ISR → 100 kHz STEP → ~275 mm/s feed (current — matches docs: 300 mm/s working speed)
+// Teensy 4.1 at 600 MHz handles 200 kHz FP ISR comfortably.
+static constexpr double STEP_ISR_HZ = 200000.0;
+
+void stepIsr() {
+  gStepIsrCount++;
+  // 1) During ARCFEED: recompute the synchronized Z target from bend ticks.
+  //    Do NOT instantly jump gZVirtualPulse — let the rate limiter below
+  //    catch up at gZSpeedStep ticks per ISR. Instant-jumping caused the
+  //    "servo speed runaway" where the carriage flew at the maximum step
+  //    rate (~hundreds of mm/s) during bending, far above the configured
+  //    feed speed.
+  if (gArcActive) {
+    long ticksMoved = abs(gBendTicks - gArcStartBendTicks);
+    double degreesMoved = ticksMoved / 4.0;  // Quadrature X4: 4 ticks = 1 degree
+    
+    // Check if target angle has been reached
+    if (degreesMoved >= gArcTargetAngle) {
+      // Auto-stop the arc when target angle is achieved
+      gArcActive = false;
+      gZTargetPulse = (long)gZVirtualPulse;
+    } else {
+      // Still bending: update Z position to follow arc
+      double mmMoved = (gArcRadius * 3.1415926535 * degreesMoved) / 180.0;
+      long additionalPulse = (long)(mmMoved * Z_CMD_TICKS_PER_MM);
+      gZTargetPulse = gArcStartZPulse + additionalPulse;
+      gZst = 2;
     }
-    int rl = 3 + n*2;
-    uint16_t c = crc16(r, rl);
-    r[rl++] = c & 0xFF; r[rl++] = c >> 8;
-    mbSend(r, rl);
-  }
-  else if (fc == 0x10 && len >= 9) {
-    /* FC 10: Write Multiple Registers */
-    uint16_t s = (f[2]<<8)|f[3], n = (f[4]<<8)|f[5];
-    uint8_t bc = f[6];
-    if (s+n > NUM_REGS || bc != n*2 || len < 9+(int)bc) return;
-    for (int i = 0; i < n; i++) {
-      int reg = s + i;
-      /* защита r/o регистров */
-      if (reg == R_EXT_CMD || reg == R_EXT_TGT) continue;
-      if (reg >= R_Z_POS) continue;
-      regs[reg] = (f[7+i*2]<<8) | f[8+i*2];
-    }
-    uint8_t r[8] = { MODBUS_ADDR, 0x10, f[2],f[3], f[4],f[5], 0,0 };
-    uint16_t c = crc16(r, 6);
-    r[6] = c & 0xFF; r[7] = c >> 8;
-    mbSend(r, 8);
-  }
-  else {
-    /* Exception: Illegal Function */
-    uint8_t r[5] = { MODBUS_ADDR, (uint8_t)(fc|0x80), 0x01, 0,0 };
-    uint16_t c = crc16(r, 3);
-    r[3] = c & 0xFF; r[4] = c >> 8;
-    mbSend(r, 5);
-  }
-}
-
-/* RS-485 приём */
-static uint8_t rxB[256];
-static int rxN = 0;
-static unsigned long rxT = 0;
-
-void pollMb() {
-  while (Serial1.available() && rxN < 255) {
-    rxB[rxN++] = Serial1.read();
-    rxT = micros();
-  }
-  if (rxN > 0 && (micros() - rxT > 1750)) {   /* t3.5 gap: фикс. 1750 мкс для скоростей >19200 (в т.ч. 115200) */
-    if (rxN >= 4) mbHandle(rxB, rxN);
-    rxN = 0;
-  }
-  if (rxN > 0 && (micros() - rxT > 50000))     /* таймаут мусора */
-    rxN = 0;
-}
-
-/* ======================== STEP ISR — ТРАПЕЦЕИДАЛЬНЫЙ ПРОФИЛЬ ======================== */
-
-/*
- * Алгоритм: f += acc/f (разгон), f -= acc/f (торможение)
- * decelN отслеживает кол-во шагов разгона — столько же нужно на торможение.
- * Когда remaining <= decelN → переход на торможение.
- * Треугольный профиль (короткие перемещения) обрабатывается автоматически.
- */
-
-void isrZ() {
-  /* --- Homing --- */
-  if (az.st == ST_HOMING) {
-    if (az.hp == HP_BACK) {
-      digitalWriteFast(PIN_DIR_Z, HIGH);
-      digitalWriteFast(PIN_STEP_Z, HIGH);
-      delayMicroseconds(PULSE_US);
-      digitalWriteFast(PIN_STEP_Z, LOW);
-      az.pos++;
-      if (az.pos >= az.backTgt) {
-        az.hp = HP_REFINE;
-        tmZ.update((unsigned long)(1000000.0f / HOME_FREQ_SLOW));
-      }
-    } else { /* HP_SEEK или HP_REFINE */
-      digitalWriteFast(PIN_DIR_Z, LOW);
-      digitalWriteFast(PIN_STEP_Z, HIGH);
-      delayMicroseconds(PULSE_US);
-      digitalWriteFast(PIN_STEP_Z, LOW);
-      az.pos--;
-    }
-    return;
   }
 
-  /* --- Обычное движение --- */
-  if (az.st != ST_MOVING) { tmZ.end(); return; }
-
-  long rem = az.total - az.done;
-  if (rem <= 0) { az.st = ST_DONE; tmZ.end(); return; }
-
-  /* Импульс Step */
-  digitalWriteFast(PIN_STEP_Z, HIGH);
-
-  az.pos += az.dir;
-  az.done++;
-  rem--;
-
-  /* Обновление частоты */
-  float f = az.freq;
-  if (rem <= az.decelN) {
-    f -= ACCEL_HZ_S_Z / f;                  /* торможение */
-    if (f < FREQ_MIN) f = FREQ_MIN;
-  } else if (f < az.freqTgt) {
-    f += ACCEL_HZ_S_Z / f;                  /* разгон */
-    if (f > az.freqTgt) f = az.freqTgt;
-    az.decelN = az.done;                     /* зеркало: торм. = разг. */
-  }
-  az.freq = f;
-
-  delayMicroseconds(PULSE_US);
-  digitalWriteFast(PIN_STEP_Z, LOW);
-
-  unsigned long iv = (unsigned long)(1000000.0f / f);
-  if (iv < MIN_INTERVAL_US) iv = MIN_INTERVAL_US;
-  tmZ.update(iv);
-}
-
-void isrC() {
-  if (ac.st == ST_HOMING) {
-    if (ac.hp == HP_BACK) {
-      digitalWriteFast(PIN_DIR_C, HIGH);
-      digitalWriteFast(PIN_STEP_C, HIGH);
-      delayMicroseconds(PULSE_US);
-      digitalWriteFast(PIN_STEP_C, LOW);
-      ac.pos++;
-      if (ac.pos >= ac.backTgt) {
-        ac.hp = HP_REFINE;
-        tmC.update((unsigned long)(1000000.0f / HOME_FREQ_SLOW));
+  // 2) Trapezoidal acceleration for Z axis (non-arc moves).
+  //    During ARCFEED, use constant rate limiter (gZSpeedStep) since
+  //    the target moves continuously with bend encoder.
+  if (!gArcActive && gZst == 2 && gZAccelRate > 1e-15) {
+    double remaining = fabs((double)gZTargetPulse - gZVirtualPulse);
+    if (remaining > 1.0) {
+      double stopDist = (gZCurSpeed * gZCurSpeed) / (2.0 * gZAccelRate);
+      if (stopDist >= remaining) {
+        gZCurSpeed -= gZAccelRate;
+        if (gZCurSpeed < gZMinSpeed) gZCurSpeed = gZMinSpeed;
+      } else if (gZCurSpeed < gZMaxSpeed) {
+        gZCurSpeed += gZAccelRate;
+        if (gZCurSpeed > gZMaxSpeed) gZCurSpeed = gZMaxSpeed;
       }
     } else {
-      digitalWriteFast(PIN_DIR_C, LOW);
-      digitalWriteFast(PIN_STEP_C, HIGH);
-      delayMicroseconds(PULSE_US);
-      digitalWriteFast(PIN_STEP_C, LOW);
-      ac.pos--;
+      gZCurSpeed = gZMinSpeed;
     }
-    return;
   }
 
-  if (ac.st != ST_MOVING) { tmC.end(); return; }
+  double zStep = (gArcActive || gZAccelRate < 1e-15) ? gZSpeedStep : gZCurSpeed;
 
-  long rem = ac.total - ac.done;
-  if (rem <= 0) { ac.st = ST_DONE; tmC.end(); return; }
-
-  digitalWriteFast(PIN_STEP_C, HIGH);
-
-  ac.pos += ac.dir;
-  ac.done++;
-  rem--;
-
-  float f = ac.freq;
-  if (rem <= ac.decelN) {
-    f -= ACCEL_HZ_S_C / f;
-    if (f < FREQ_MIN) f = FREQ_MIN;
-  } else if (f < ac.freqTgt) {
-    f += ACCEL_HZ_S_C / f;
-    if (f > ac.freqTgt) f = ac.freqTgt;
-    ac.decelN = ac.done;
+  if (gZVirtualPulse < gZTargetPulse) {
+    gZVirtualPulse += zStep;
+    if (gZVirtualPulse > gZTargetPulse) gZVirtualPulse = gZTargetPulse;
+  } else if (gZVirtualPulse > gZTargetPulse) {
+    gZVirtualPulse -= zStep;
+    if (gZVirtualPulse < gZTargetPulse) gZVirtualPulse = gZTargetPulse;
   }
-  ac.freq = f;
 
-  delayMicroseconds(PULSE_US);
-  digitalWriteFast(PIN_STEP_C, LOW);
+  // 3) Trapezoidal acceleration for C axis
+  if (gCst == 2 && gCAccelRate > 1e-15) {
+    double remaining = fabs((double)gCTargetPulse - gCVirtualPulse);
+    if (remaining > 1.0) {
+      double stopDist = (gCCurSpeed * gCCurSpeed) / (2.0 * gCAccelRate);
+      if (stopDist >= remaining) {
+        gCCurSpeed -= gCAccelRate;
+        if (gCCurSpeed < gCMinSpeed) gCCurSpeed = gCMinSpeed;
+      } else if (gCCurSpeed < gCMaxSpeed) {
+        gCCurSpeed += gCAccelRate;
+        if (gCCurSpeed > gCMaxSpeed) gCCurSpeed = gCMaxSpeed;
+      }
+    } else {
+      gCCurSpeed = gCMinSpeed;
+    }
+  }
 
-  unsigned long iv = (unsigned long)(1000000.0f / f);
-  if (iv < MIN_INTERVAL_US) iv = MIN_INTERVAL_US;
-  tmC.update(iv);
+  double cStep = (gCAccelRate < 1e-15) ? gCSpeedStep : gCCurSpeed;
+
+  if (gCVirtualPulse < gCTargetPulse) {
+    gCVirtualPulse += cStep;
+    if (gCVirtualPulse > gCTargetPulse) gCVirtualPulse = gCTargetPulse;
+  } else if (gCVirtualPulse > gCTargetPulse) {
+    gCVirtualPulse -= cStep;
+    if (gCVirtualPulse < gCTargetPulse) gCVirtualPulse = gCTargetPulse;
+  }
+
+  // Z axis
+  // DIR convention: positive Z (carriage feed toward bender) = LOW (INVERTED - FIXED).
+  // Servo DIR signal is electrically inverted on hardware
+  if (gZst == 2) {
+    long zt = (long)gZVirtualPulse;
+    if (zt - gZCurrentPulse > 0) {
+      if (!gZStepHigh) {
+        digitalWriteFast(PIN_DIR_Z, LOW); // forward = toward bender (INVERTED)
+        digitalWriteFast(PIN_STEP_Z, HIGH);
+        gZStepHigh = true;
+      } else {
+        digitalWriteFast(PIN_STEP_Z, LOW);
+        gZStepHigh = false;
+        gZCurrentPulse += 1;
+      }
+    } else if (gZCurrentPulse - zt > 0) {
+      if (!gZStepHigh) {
+        digitalWriteFast(PIN_DIR_Z, HIGH); // reverse = away from bender (INVERTED)
+        digitalWriteFast(PIN_STEP_Z, HIGH);
+        gZStepHigh = true;
+      } else {
+        digitalWriteFast(PIN_STEP_Z, LOW);
+        gZStepHigh = false;
+        gZCurrentPulse -= 1;
+      }
+    } else {
+      if ((long)gZVirtualPulse == gZTargetPulse) gZst = 0;
+    }
+  }
+
+  // C axis
+  if (gCst == 2) {
+    long ct = (long)gCVirtualPulse;
+    if (ct - gCCurrentPulse > 0) {
+      if (!gCStepHigh) {
+        digitalWriteFast(PIN_DIR_C, LOW); // ORIGINAL DIR
+        digitalWriteFast(PIN_STEP_C, HIGH);
+        gCStepHigh = true;
+      } else {
+        digitalWriteFast(PIN_STEP_C, LOW);
+        gCStepHigh = false;
+        gCCurrentPulse += 1;
+      }
+    } else if (gCCurrentPulse - ct > 0) {
+      if (!gCStepHigh) {
+        digitalWriteFast(PIN_DIR_C, HIGH); // ORIGINAL DIR
+        digitalWriteFast(PIN_STEP_C, HIGH);
+        gCStepHigh = true;
+      } else {
+        digitalWriteFast(PIN_STEP_C, LOW);
+        gCStepHigh = false;
+        gCCurrentPulse -= 1;
+      }
+    } else {
+      if ((long)gCVirtualPulse == gCTargetPulse && ct == gCCurrentPulse) gCst = 0;
+    }
+  }
 }
 
-/* ======================== УПРАВЛЕНИЕ ОСЯМИ ======================== */
-
-void sonSet(Axis &a, bool on) {
-  /* SON управляется ПЛК (DO9/DO12), здесь только внутренний трекинг */
-  a.son = on;
+void updateStepTimerState() {
+  // Reverted: running intervalTimer dynamically at 40kHz was causing issues or dropping USB.
+  // Instead it will permanently run like it used to.
 }
 
-void queueExtCmdPulse(uint16_t cmd) {
-  /* SON/E-STOP (6/7/10) обрабатываются в ПЛК level-логикой: отправляем без pre-zero.
-     Остальные команды остаются pulse/edge-совместимыми. */
-  extCmdPulseVal = cmd;
-  extCmdPulseStart = millis();
-  extCmdFastMode = (cmd == 6 || cmd == 7 || cmd == 10);
-  if (extCmdFastMode) {
-    /* Level-latched режим: держим команду постоянно до следующей команды.
-       Это исключает пропуски при редком/неровном опросе ПЛК. */
-    regs[R_EXT_CMD_COMPAT] = cmd;
-    regs[R_EXT_CMD] = cmd;
+bool gServoOn = false;
+
+void sendStatusJson() {
+  long rawTicks = gBendTicks;
+  long zFb, cFb;
+  noInterrupts();
+  zFb = gZfbTicks;
+  cFb = gCfbTicks;
+  interrupts();
+  double zFbMm_raw  = (double)zFb / Z_FB_TICKS_PER_MM;
+  double cFbDeg_raw = (double)cFb / C_FB_TICKS_PER_DEG;
+  
+  // Apply Low-Pass Filter (moving average) to eliminate encoder pulsation
+  double zFbMm  = updateMovingAverage(zFbMm_raw, zMmFilterBuffer, ENC_FILTER_SAMPLES, zMmFilterIndex);
+  double cFbDeg = updateMovingAverage(cFbDeg_raw, cDegFilterBuffer, ENC_FILTER_SAMPLES, cDegFilterIndex);
+  
+  int bendCur = bendDegFromTicks(rawTicks);
+  bool fwd = pedalFwdPressed();
+  bool rev = pedalRevPressed();
+  bool autoMode = modeAuto();
+
+  int sonZOut = digitalRead(PIN_SON_Z) ? 1 : 0;
+  int sonCOut = digitalRead(PIN_SON_C) ? 1 : 0;
+  int pedalIn = pedalFwdPressed() ? 1 : 0;
+  int modeIn = modeAuto() ? 1 : 0;
+
+  // Determine VFD online status.
+  // True ONLINE requires: at least one successful RX reply AND the error rate is
+  // not dominating the traffic. Previously we reported "ok=1" after firmware
+  // boot simply because gMbTx>0, which gave a false-positive "VFD online"
+  // indicator in EXE even though every transaction timed out.
+  int mbOk = 0;
+  if (gMbRx > 0 && gMbTx > 0) {
+    // Require successful replies to outnumber hard errors (allow 10% margin)
+    if (gMbErr == 0 || gMbRx * 10 > gMbErr) mbOk = 1;
+  }
+
+  char out[768];
+  snprintf(out, sizeof(out),
+    "{\"v\":\"%s\"," \
+    "\"mb\":{\"rx\":%lu,\"tx\":%lu,\"err\":%lu,\"link\":%lu,\"ok\":%d}," \
+    "\"z\":{\"mm\":%.3f,\"st\":%d,\"son\":%d}," \
+    "\"c\":{\"deg\":%.3f,\"st\":%d,\"son\":%d}," \
+    "\"enc\":{\"zCnt\":%ld,\"cCnt\":%ld,\"zMm\":%.3f,\"cDeg\":%.3f}," \
+    "\"bend\":{\"cur\":%d,\"tgt\":%d,\"cyc\":%d,\"mode\":%d,\"done\":%d,\"pedalFwd\":%d,\"pedalRev\":%d,\"clampClosed\":%d}," \
+    "\"vfd\":{\"freq\":%.2f,\"freqTgt\":%.2f,\"cur\":%.2f,\"ctrlWord\":\"0x%04X\",\"sim\":%d}," \
+    "\"lim\":{\"zMin\":%d,\"zMax\":%d}," \
+    "\"boot\":{\"rst\":%lu,\"upMs\":%lu}," \
+    "\"diag\":{\"loopHz\":%lu,\"loopMaxUs\":%lu,\"stepHz\":%lu,\"bendIsrHz\":%lu,\"zIsrHz\":%lu,\"cIsrHz\":%lu,\"rxHz\":%lu,\"rxOvHz\":%lu,\"sonZOut\":%d,\"sonCOut\":%d,\"pedalIn\":%d,\"modeIn\":%d}," \
+    "\"wd\":0}",
+    FW_VERSION,
+    gMbRx, gMbTx, gMbErr, gMbLink, mbOk,
+    gZmm, gZst, gServoOn ? 1 : 0,
+    gCdeg, gCst, gServoOn ? 1 : 0,
+    zFb, cFb, zFbMm, cFbDeg,
+    bendCur, gBendTargetDeg, gBendCycle, autoMode ? 1 : 0, gBendDone ? 1 : 0, fwd ? 1 : 0, rev ? 1 : 0, gClampClosed ? 1 : 0,
+    gVfdCurrentFreqCode / 100.0,
+    gVfdTargetFreqCode / 100.0,
+    gVfdCurrentCurrent / 10.0,
+    gVfdControlWord,
+    (gVfdSimulationMode ? 1 : 0),
+    limZMin() ? 1 : 0, limZMax() ? 1 : 0,
+    gResetCause, millis(),
+    (unsigned long)gDiagLoopHz,
+    (unsigned long)gDiagLoopMaxUs,
+    (unsigned long)gDiagStepHz,
+    (unsigned long)gDiagBendHz,
+    (unsigned long)gDiagZfbHz,
+    (unsigned long)gDiagCfbHz,
+    (unsigned long)gDiagRxCharsPerSec,
+    (unsigned long)gDiagRxOverflowPerSec,
+    sonZOut, sonCOut, pedalIn, modeIn
+  );
+  Serial.println(out);
+}
+
+void cmdSon(int on) {
+  gServoOn = (on != 0);
+#if SON_DRYRUN
+  digitalWrite(PIN_SON_Z, LOW);
+  digitalWrite(PIN_SON_C, LOW);
+  Serial.println("OK SON DRYRUN");
+#else
+  digitalWrite(PIN_SON_Z, on ? HIGH : LOW);
+  digitalWrite(PIN_SON_C, on ? HIGH : LOW);
+
+  Serial.println("OK SON");
+#endif
+}
+
+// ──── VFD Control Functions ────
+
+void cmdVfdFrequency(float freqHz, int direction) {
+  // Convert frequency to Modbus code (0.01Hz units)
+  // 50Hz = 5000 code, 60Hz = 6000 code
+  uint16_t freqCode = (uint16_t)(freqHz * 100.0);
+  
+  // Clamp to valid range (0-6000 = 0-60Hz)
+  if (freqCode > 6000) freqCode = 6000;
+  
+  // Build control word
+  uint16_t controlWord = 0;
+  if (freqCode > 0) {
+    controlWord |= 0x0001;  // bit 0: RUN
+    if (direction == 0) {
+      // Forward = bit 1 clear
+    } else {
+      controlWord |= 0x0002;  // bit 1: REVERSE
+    }
+  }
+  
+  gVfdTargetFreqCode = freqCode;
+  gVfdControlWord = controlWord;
+  gVfdLastUpdateMs = millis();
+  
+  if (gVfdSimulationMode) {
+    // Simulate VFD frequency ramp
+    gVfdSimFreq = freqHz;
+    gVfdCurrentFreqCode = freqCode;
+    Serial.println("OK VFDFREQ (simulated)");
   } else {
-    regs[R_EXT_CMD_COMPAT] = 0;
-    regs[R_EXT_CMD] = 0;
-  }
-  extCmdT = millis();
-}
-
-void serviceExtCmdPulse() {
-  if (extCmdPulseVal == 0) return;
-
-  unsigned long now = millis();
-  unsigned long elapsed = now - extCmdPulseStart;
-
-  if (extCmdFastMode) {
-    /* Для level-команд 6/7/10 НЕ делаем автосброс в 0.
-       ПЛК сам трактует уровень mb_in_Command и держит SON-состояние стабильно. */
-    regs[R_EXT_CMD_COMPAT] = extCmdPulseVal;
-    regs[R_EXT_CMD] = extCmdPulseVal;
-    return;
-  }
-
-  if (elapsed < EXT_CMD_PREZERO_MS) {
-    /* pre-zero: сбросить предыдущее значение в ПЛК */
-    regs[R_EXT_CMD_COMPAT] = 0;
-    regs[R_EXT_CMD] = 0;
-    return;
-  }
-
-  if (elapsed < (EXT_CMD_PREZERO_MS + EXT_CMD_HOLD_MS)) {
-    /* удерживать команду достаточно долго (как в ESP: ~1с+) */
-    regs[R_EXT_CMD_COMPAT] = extCmdPulseVal;
-    regs[R_EXT_CMD] = extCmdPulseVal;
-    return;
-  }
-
-  if (elapsed < (EXT_CMD_PREZERO_MS + EXT_CMD_HOLD_MS + EXT_CMD_POSTZERO_MS)) {
-    /* post-zero: дать ПЛК сбросить prev_mb_in_command */
-    regs[R_EXT_CMD_COMPAT] = 0;
-    regs[R_EXT_CMD] = 0;
-    return;
-  }
-
-  {
-    regs[R_EXT_CMD_COMPAT] = 0;
-    regs[R_EXT_CMD] = 0;
-    extCmdPulseVal = 0;
-    extCmdPulseStart = 0;
-    extCmdFastMode = false;
-    extCmdT = 0;
-  }
-}
-
-void axStop(Axis &a, IntervalTimer &t) {
-  t.end();
-  a.st = ST_IDLE;
-  a.hp = HP_NONE;
-}
-
-void eStop() {
-  tmZ.end(); tmC.end();
-  az.st = ST_IDLE; az.hp = HP_NONE;
-  ac.st = ST_IDLE; ac.hp = HP_NONE;
-  az.son = false; ac.son = false;
-  /* Отправить E-Stop в ПЛК (CMD 10) → SON OFF на DO7/DO8 */
-  queueExtCmdPulse(10);
-}
-
-void startMove(Axis &a, IntervalTimer &t, void(*isr)(), long tgtSteps, float maxFreq) {
-  if (!a.son) { a.st = ST_ERROR; return; }
-
-  t.end();
-
-  long delta = tgtSteps - a.pos;
-  if (delta == 0) { a.st = ST_DONE; return; }
-
-  a.tgt     = tgtSteps;
-  a.dir     = (delta > 0) ? 1 : -1;
-  a.total   = labs(delta);
-  a.done    = 0;
-  a.decelN  = 0;
-  a.freq    = FREQ_MIN;
-  a.freqTgt = maxFreq;
-  a.st      = ST_MOVING;
-
-  digitalWriteFast(a.pDir, delta > 0 ? HIGH : LOW);
-
-  unsigned long iv = (unsigned long)(1000000.0f / FREQ_MIN);
-  t.begin(isr, iv);
-}
-
-void startHome(Axis &a, IntervalTimer &t, void(*isr)()) {
-  if (!a.son) { sonSet(a, true); delay(200); }
-  t.end();
-  a.st = ST_HOMING;
-  a.hp = HP_SEEK;
-  t.begin(isr, (unsigned long)(1000000.0f / HOME_FREQ));
-}
-
-/* Home debounce */
-bool readHome(Axis &a) {
-  bool raw = (digitalReadFast(a.pHome) == LOW);
-  if (raw != a.dbRaw) { a.dbT = millis(); a.dbRaw = raw; }
-  if ((millis() - a.dbT) >= DEBOUNCE_MS) a.sensor = a.dbRaw;
-  return a.sensor;
-}
-
-/* Home FSM (вызывается из loop) */
-void homeUpdate(Axis &a, IntervalTimer &t, void(*isr)()) {
-  if (a.st != ST_HOMING) return;
-  bool hit = readHome(a);
-
-  if (a.hp == HP_SEEK && hit) {
-    t.end();
-    a.hp = HP_BACK;
-    a.backTgt = a.pos + HOME_BACKOFF;
-    t.begin(isr, (unsigned long)(1000000.0f / HOME_FREQ));
-  }
-  else if (a.hp == HP_REFINE && hit) {
-    t.end();
-    a.pos = 0;
-    a.tgt = 0;
-    a.st  = ST_DONE;
-    a.hp  = HP_NONE;
-  }
-}
-
-/* Команды осей из регистра R_AXIS_CMD */
-void procAxisCmd() {
-  uint16_t cmd = regs[R_AXIS_CMD];
-  if (cmd == 0) return;
-  regs[R_AXIS_CMD] = 0;
-
-  switch (cmd) {
-    case 1: startHome(az, tmZ, isrZ); break;
-    case 2: startHome(ac, tmC, isrC); break;
-    case 3: {
-      int16_t mm = (int16_t)regs[R_Z_TGT];
-      uint16_t spd = regs[R_Z_SPD];
-      if (spd == 0) spd = 100;
-      float freq = spd * STEPS_MM_Z;
-      if (freq > FREQ_MAX_Z) freq = FREQ_MAX_Z;
-      startMove(az, tmZ, isrZ, (long)(mm * STEPS_MM_Z), freq);
-      break;
+    // Send to real VFD via Modbus
+    if (gVfdModbus) {
+      bool freqOk = gVfdModbus->writeFrequency(freqCode);
+      bool ctrlOk = gVfdModbus->writeControl(controlWord);
+      if (freqOk && ctrlOk) {
+        gVfdCurrentFreqCode = freqCode;
+        gMbTx += 2;
+        Serial.println("OK VFDFREQ");
+      } else {
+        gMbErr++;
+        Serial.println("ERR VFDFREQ modbus failed");
+      }
     }
-    case 4: {
-      int16_t d10 = (int16_t)regs[R_C_TGT];
-      uint16_t spd = regs[R_C_SPD];
-      if (spd == 0) spd = 30;
-      float freq = spd * STEPS_DEG_C;
-      if (freq > FREQ_MAX_C) freq = FREQ_MAX_C;
-      startMove(ac, tmC, isrC, (long)(d10 / 10.0f * STEPS_DEG_C), freq);
-      break;
-    }
-    case 5:  axStop(az, tmZ); axStop(ac, tmC); break;
-    case 6:  az.son = true;  ac.son = true;
-             queueExtCmdPulse(6); break;  /* SON ON → ПЛК */
-    case 7:  axStop(az, tmZ); axStop(ac, tmC);
-             az.son = false; ac.son = false;
-             queueExtCmdPulse(7); break;  /* SON OFF → ПЛК */
-    case 10: eStop(); break;
   }
 }
 
-/* Обновление read-only регистров */
-void updateRegs() {
+void cmdVfdStop() {
+  gVfdTargetFreqCode = 0;
+  gVfdControlWord = 0;
+  
+  if (gVfdSimulationMode) {
+    gVfdSimFreq = 0.0;
+    gVfdCurrentFreqCode = 0;
+    Serial.println("OK VFDSTOP (simulated)");
+  } else {
+    if (gVfdModbus) {
+      gVfdModbus->writeControl(0);  // Stop bit
+      gVfdModbus->writeFrequency(0);
+      gVfdCurrentFreqCode = 0;
+      gMbTx += 2;
+      Serial.println("OK VFDSTOP");
+    }
+  }
+}
+
+void pollVfdStatus() {
+  if (gVfdSimulationMode) {
+    // Simulate VFD response with frequency ramp
+    float targetFreq = gVfdTargetFreqCode / 100.0;
+    if (gVfdSimFreq < targetFreq) {
+      gVfdSimFreq += 2.0;  // Ramp at 2 Hz/update
+      if (gVfdSimFreq > targetFreq) {
+        gVfdSimFreq = targetFreq;
+      }
+    } else if (gVfdSimFreq > targetFreq) {
+      gVfdSimFreq -= 2.0;
+      if (gVfdSimFreq < targetFreq) {
+        gVfdSimFreq = targetFreq;
+      }
+    }
+    gVfdCurrentFreqCode = (uint16_t)(gVfdSimFreq * 100.0);
+    gVfdCurrentCurrent = 0;  // No current feedback in simulation
+    gVfdStatusValid = true;
+    gMbRx++;
+  } else {
+    // Read actual VFD status via Modbus
+    if (gVfdModbus) {
+      uint16_t statusRegs[3];
+      if (gVfdModbus->readRegisters(0x0100, 3, statusRegs)) {
+        gVfdCurrentFreqCode = statusRegs[1];  // Frequency feedback
+        gVfdCurrentCurrent = statusRegs[2];   // Current feedback
+        gVfdStatusValid = true;
+        gMbRx++;
+      } else {
+        gMbErr++;
+      }
+    }
+  }
+}
+
+// ──── End VFD Control Functions ────
+
+void cmdEStop() {
+  // ESTOP must be as thorough as STOP: freeze step generators immediately
+  // to prevent ISR from chasing stale targets while servos are being disabled.
   noInterrupts();
-  long zp = az.pos, cp = ac.pos;
-  uint8_t zs = az.st, cs = ac.st;
+  gVfdRunning = false;
+  gBendDone = true;
+  gArcActive = false;
+  gZst = 0;
+  gCst = 0;
+  // Freeze step generators at current physical position
+  gZTargetPulse = (long)(gZfbTicks * CMD_PER_FB);
+  gZVirtualPulse = (double)(gZfbTicks * CMD_PER_FB);
+  gZCurrentPulse = (long)(gZfbTicks * CMD_PER_FB);
+  gCTargetPulse = (long)(gCfbTicks * CMD_PER_FB);
+  gCVirtualPulse = (double)(gCfbTicks * CMD_PER_FB);
+  gCCurrentPulse = (long)(gCfbTicks * CMD_PER_FB);
+  // Reset trapezoidal speeds
+  gZCurSpeed = 0;
+  gCCurSpeed = 0;
+  // Reset bending state
+  gBendingState = 0;
+  gBendTargetDeg = 0;
+  gStepCurrent = 0;
+  gStepTotal = 0;
   interrupts();
-
-  regs[R_Z_POS] = (uint16_t)(int16_t)(zp / STEPS_MM_Z);
-  regs[R_Z_ST]  = zs;
-  regs[R_C_POS] = (uint16_t)(int16_t)(cp * 10.0f / STEPS_DEG_C);
-  regs[R_C_ST]  = cs;
-
-  uint16_t fl = 0;
-  if (az.son)    fl |= 0x01;
-  if (ac.son)    fl |= 0x02;
-  if (az.sensor) fl |= 0x04;
-  if (ac.sensor) fl |= 0x08;
-  if (!wdTrip)   fl |= 0x10;
-  regs[R_FLAGS] = fl;
+  // Disable servos, VFD, and clamps
+  gServoOn = false;
+  digitalWrite(PIN_SON_Z, LOW);
+  digitalWrite(PIN_SON_C, LOW);
+  digitalWrite(PIN_CLAMP, HIGH);    // Both HIGH = both disabled (active LOW!)
+  digitalWrite(PIN_UNCLAMP, HIGH);  // Both HIGH = both disabled (active LOW!)
+  
+  // Stop VFD
+  cmdVfdStop();
+  
+  Serial.println("OK ESTOP");
 }
 
-/* ======================== WATCHDOG ======================== */
+unsigned long gLastExePing = 0;
 
-void checkWD() {
-  if (mbOkTime == 0) return;
-  bool lost = (millis() - mbOkTime) > WD_TIMEOUT_MS;
-  if (lost && !wdTrip) {
-    wdTrip = true;
-    eStop();
-    Serial.println("!WD: Modbus lost >2s, E-Stop!");
-  } else if (!lost) {
-    wdTrip = false;
+void handleCommand(const String& line) {
+  gLastExePing = millis();
+  if (line.length() == 0) return;
+
+  if (line == "?") {
+    sendStatusJson();
+    return;
   }
-}
-
-/* Проверка аларм серво (от ПЛК через Modbus рег.7) */
-void checkAlarms() {
-  uint16_t alm = regs[R_ALARMS];
-
-  /* ФАКТИЧЕСКИЙ статус SON из ПЛК: gDO_7/gDO_8 */
-  az.son = (alm & 0x04) != 0;  /* bit2 = DO7 */
-  ac.son = (alm & 0x08) != 0;  /* bit3 = DO8 */
-
-  /* Если аларм — остановить соответствующую ось и снять SON */
-  if (alm & 1) { /* almZ */
-    if (az.son) { axStop(az, tmZ); az.son = false; }
+  if (line == "STOP" || line == "CMD 2") {
+    noInterrupts();
+    gVfdRunning = false;
+    gBendDone = true;
+    gZst = 0;
+    gCst = 0;
+    gArcActive = false;
+    // Freeze step generator at its current physical position so the
+    // rate limiter does not chase a stale target after STOP.
+    gZTargetPulse = (long)(gZfbTicks * CMD_PER_FB);
+    gZVirtualPulse = (double)(gZfbTicks * CMD_PER_FB);
+    gZCurrentPulse = (long)(gZfbTicks * CMD_PER_FB);
+    gCTargetPulse = (long)(gCfbTicks * CMD_PER_FB);
+    gCVirtualPulse = (double)(gCfbTicks * CMD_PER_FB);
+    gCCurrentPulse = (long)(gCfbTicks * CMD_PER_FB);
+    // Reset bending state so LCD does not stay on a step screen
+    gBendingState = 0;
+    gBendTargetDeg = 0;
+    // Reset trapezoidal speeds
+    gZCurSpeed = 0;
+    gCCurSpeed = 0;
+    gStepCurrent = 0;
+    gStepTotal = 0;
+    interrupts();
+    Serial.println("OK STOP");
+    return;
   }
-  if (alm & 2) { /* almC */
-    if (ac.son) { axStop(ac, tmC); ac.son = false; }
+  if (line == "ESTOP") {
+    cmdEStop();
+    return;
   }
-}
-
-/* Авто-сброс команд ПЛК */
-void clearPlcRegs() {
-  if (regs[R_EXT_TGT] && extTgtT && (millis()-extTgtT > 2000))
-    { regs[R_EXT_TGT] = 0; extTgtT = 0; }
-}
-
-/* ======================== USB-SERIAL ПРОТОКОЛ ======================== */
-
-/*
- * Команды (завершаются \n):
- *   ?           — JSON-статус
- *   HELP        — список команд
- *   REGS        — дамп всех регистров
- *   MZ pos,spd  — движение Z (мм, мм/с)
- *   MC pos,spd  — движение C (°, °/с)
- *   HZ / HC     — Home ось Z / C
- *   STOP        — остановить обе оси
- *   ESTOP       — аварийная остановка + SON off
- *   SON 1/0     — Servo ON/OFF обе оси
- *   CMD n       — записать gExtCommand (рег.9)
- *   TGT n       — записать gExtTarget (рег.10)
- *   WR reg val  — записать произвольный регистр
- */
-
-void printStatus() {
-  unsigned long lnk = (mbOkTime > 0) ? (millis() - mbOkTime) : 99999;
-  noInterrupts();
-  long zp = az.pos, cp = ac.pos;
-  uint8_t zs = az.st, cs = ac.st;
-  interrupts();
-
-  Serial.print("{\"v\":\"" FW_VERSION "\",\"mb\":{\"rx\":");
-  Serial.print(mbRx);   Serial.print(",\"tx\":");
-  Serial.print(mbTx);   Serial.print(",\"err\":");
-  Serial.print(mbErr);  Serial.print(",\"link\":");
-  Serial.print(lnk);
-  Serial.print("},\"z\":{\"mm\":");
-  Serial.print(zp / STEPS_MM_Z, 2);
-  Serial.print(",\"st\":"); Serial.print(zs);
-  Serial.print(",\"son\":"); Serial.print(az.son);
-  Serial.print("},\"c\":{\"deg\":");
-  Serial.print(cp / STEPS_DEG_C, 2);
-  Serial.print(",\"st\":"); Serial.print(cs);
-  Serial.print(",\"son\":"); Serial.print(ac.son);
-  Serial.print("},\"bend\":{\"cur\":");
-  Serial.print((int16_t)regs[R_CUR_ANGLE]);
-  Serial.print(",\"tgt\":"); Serial.print((int16_t)regs[R_TGT_ANGLE]);
-  Serial.print(",\"cyc\":"); Serial.print(regs[R_CYCLE]);
-  Serial.print(",\"mode\":"); Serial.print(regs[R_MODE]);
-  Serial.print(",\"done\":"); Serial.print(regs[R_DONE]);
-  Serial.print("},\"wd\":"); Serial.print(wdTrip);
-  Serial.print(",\"alm\":{\"z\":"); Serial.print((regs[R_ALARMS] & 1) ? 1 : 0);
-  Serial.print(",\"c\":"); Serial.print((regs[R_ALARMS] & 2) ? 1 : 0);
-  Serial.print("},\"ext\":{\"cmd8\":"); Serial.print((int16_t)regs[R_EXT_CMD_COMPAT]);
-  Serial.print(",\"cmd9\":"); Serial.print((int16_t)regs[R_EXT_CMD]);
-  Serial.print(",\"tgt10\":"); Serial.print((int16_t)regs[R_EXT_TGT]);
-  Serial.print(",\"pulse\":"); Serial.print(extCmdPulseVal ? 1 : 0);
-  Serial.print(",\"fast\":"); Serial.print(extCmdFastMode ? 1 : 0);
-  Serial.print(",\"do7\":"); Serial.print((regs[R_ALARMS] & 4) ? 1 : 0);
-  Serial.print(",\"do8\":"); Serial.print((regs[R_ALARMS] & 8) ? 1 : 0);
-  Serial.print("}");
-  Serial.println("}");
-}
-
-void processUsb(const char *cmd) {
-  /* Статус */
-  if (cmd[0] == '?') { printStatus(); return; }
-
-  /* Дамп регистров */
-  if (strncmp(cmd, "REGS", 4) == 0) {
-    for (int i = 0; i < NUM_REGS; i++) {
-      Serial.print("R"); Serial.print(i); Serial.print("=");
-      Serial.print((int16_t)regs[i]);
-      Serial.print(i < NUM_REGS-1 ? " " : "\n");
+  if (line == "CLAMP") {
+    gClampClosed = true;
+    // Ensure unclamp is OFF first (ACTIVE LOW: HIGH = OFF)
+    digitalWrite(PIN_UNCLAMP, HIGH);
+    delay(50);  // Wait for relay to release before activating clamp
+    // Now activate clamp (ACTIVE LOW: LOW = ON)
+    digitalWrite(PIN_CLAMP, LOW);
+    Serial.println("OK CLAMP");
+    return;
+  }
+  if (line == "UNCLAMP") {
+    gClampClosed = false;
+    // Ensure clamp is OFF first (ACTIVE LOW: HIGH = OFF)
+    digitalWrite(PIN_CLAMP, HIGH);
+    delay(50);  // Wait for relay to release before activating unclamp
+    // Now activate unclamp (ACTIVE LOW: LOW = ON)
+    digitalWrite(PIN_UNCLAMP, LOW);
+    Serial.println("OK UNCLAMP");
+    return;
+  }
+  // RELAYOFF — de-energize BOTH pneumatic relays simultaneously.
+  // Needed so the operator can completely cut clamp air from the UI
+  // (previously toggling either button only swapped between the two
+  // active states and never let both go OFF at once).
+  if (line == "RELAYOFF") {
+    gClampClosed = false;
+    digitalWrite(PIN_CLAMP,   HIGH);  // ACTIVE LOW: HIGH = OFF
+    digitalWrite(PIN_UNCLAMP, HIGH);
+    Serial.println("OK RELAYOFF");
+    return;
+  }
+  // Individual pin control for testing (PIN35 ON/OFF, PIN36 ON/OFF)
+  if (line == "PIN35 ON") {
+    digitalWrite(PIN_CLAMP, HIGH);  // ACTIVE LOW: HIGH = OFF
+    Serial.println("OK PIN35 ON");
+    return;
+  }
+  if (line == "PIN35 OFF") {
+    digitalWrite(PIN_CLAMP, LOW);   // ACTIVE LOW: LOW = ON
+    Serial.println("OK PIN35 OFF");
+    return;
+  }
+  if (line == "PIN36 ON") {
+    digitalWrite(PIN_UNCLAMP, HIGH); // ACTIVE LOW: HIGH = OFF
+    Serial.println("OK PIN36 ON");
+    return;
+  }
+  if (line == "PIN36 OFF") {
+    digitalWrite(PIN_UNCLAMP, LOW);  // ACTIVE LOW: LOW = ON
+    Serial.println("OK PIN36 OFF");
+    return;
+  }
+  // Relay test command: RELAY_TEST <pin> <state>
+  if (line.startsWith("RELAY_TEST")) {
+    int spaceIdx = line.indexOf(' ');
+    if (spaceIdx > 0) {
+      int pin = line.substring(spaceIdx + 1).toInt();
+      int spaceIdx2 = line.indexOf(' ', spaceIdx + 1);
+      int state = 0;
+      if (spaceIdx2 > 0) {
+        state = line.substring(spaceIdx2 + 1).toInt();
+      }
+      digitalWrite(pin, state ? HIGH : LOW);
+      Serial.print("OK RELAY_TEST ");
+      Serial.print(pin);
+      Serial.print(" ");
+      Serial.println(state);
     }
     return;
   }
-
-  /* Помощь */
-  if (strncmp(cmd, "HELP", 4) == 0) {
-    Serial.println(F(
-      "?         JSON status\n"
-      "REGS      dump registers\n"
-      "MZ mm,spd move Z (mm, mm/s)\n"
-      "MC deg,spd move C (deg, deg/s)\n"
-      "HZ / HC   home axis\n"
-      "STOP      stop axes\n"
-      "ESTOP     e-stop + SON off\n"
-      "SON 1/0   servo on/off\n"
-      "CMD n     set gExtCommand\n"
-      "TGT n     set gExtTarget\n"
-      "WR r v    write register"
-    ));
+  if (line == "ZP") {
+    gZmm = 0.0;
+    gCdeg = 0.0;
+    gBendTicks = 0;
+    gBendTicksLast = 0; // Fix: reset tracking variable too
+    noInterrupts();
+    gZfbTicks = 0;
+    gCfbTicks = 0;
+    interrupts();
+    // NOTE: ZP is runtime zeroing for current cycle, do not persist to EEPROM.
+    Serial.println("OK ZP");
     return;
   }
-
-  /* Move Z */
-  if (cmd[0] == 'M' && cmd[1] == 'Z') {
-    float pos = 0, spd = 100;
-    if (sscanf(cmd+2, "%f,%f", &pos, &spd) >= 1) {
-      float freq = fabsf(spd) * STEPS_MM_Z;
-      if (freq > FREQ_MAX_Z) freq = FREQ_MAX_Z;
-      if (freq < FREQ_MIN)   freq = FREQ_MIN;
-      startMove(az, tmZ, isrZ, (long)(pos * STEPS_MM_Z), freq);
-      Serial.println("OK MZ");
-    } else Serial.println("ERR MZ");
+  if (line == "SYNC") {
+    Serial.println("OK SYNC");
     return;
   }
-
-  /* Move C */
-  if (cmd[0] == 'M' && cmd[1] == 'C') {
-    float pos = 0, spd = 30;
-    if (sscanf(cmd+2, "%f,%f", &pos, &spd) >= 1) {
-      float freq = fabsf(spd) * STEPS_DEG_C;
-      if (freq > FREQ_MAX_C) freq = FREQ_MAX_C;
-      if (freq < FREQ_MIN)   freq = FREQ_MIN;
-      startMove(ac, tmC, isrC, (long)(pos * STEPS_DEG_C), freq);
-      Serial.println("OK MC");
-    } else Serial.println("ERR MC");
+  if (line == "BZ") {
+    // Zero bend encoder ONLY (carriage Z and chuck C untouched), persist
+    noInterrupts();
+    gBendTicks = 0;
+    gBendTicksLast = 0; // Fix: reset tracking variable too
+    interrupts();
+    saveCalibration();
+    Serial.println("OK BZ");
     return;
   }
-
-  /* Home */
-  if (cmd[0]=='H' && cmd[1]=='Z') { startHome(az, tmZ, isrZ); Serial.println("OK HZ"); return; }
-  if (cmd[0]=='H' && cmd[1]=='C') { startHome(ac, tmC, isrC); Serial.println("OK HC"); return; }
-
-  /* Stop */
-  if (strncmp(cmd,"STOP",4)==0) { axStop(az,tmZ); axStop(ac,tmC); Serial.println("OK STOP"); return; }
-  if (strncmp(cmd,"ESTOP",5)==0) { eStop(); Serial.println("OK ESTOP"); return; }
-
-  /* Servo ON/OFF → forwarded to PLC via Modbus CMD */
-  if (strncmp(cmd,"SON",3)==0) {
-    int v = atoi(cmd+3);
-    az.son = (v != 0); ac.son = (v != 0);
-    queueExtCmdPulse(v ? 6 : 7);  /* CMD 6=SON ON, CMD 7=SON OFF → ПЛК DO9/DO12 */
-    Serial.print("OK SON "); Serial.println(v);
+  if (line.startsWith("CAL ")) {
+    // CAL z,c,bend  — set all three axis displays at once and persist
+    String s = line.substring(4);
+    int c1 = s.indexOf(',');
+    int c2 = (c1 > 0) ? s.indexOf(',', c1 + 1) : -1;
+    if (c1 > 0 && c2 > 0) {
+      double newZ = s.substring(0, c1).toFloat();
+      double newC = s.substring(c1 + 1, c2).toFloat();
+      int    newB = s.substring(c2 + 1).toInt();
+      gZmm  = newZ;
+      gCdeg = newC;
+      noInterrupts();
+      gZfbTicks  = (long)(newZ * Z_FB_TICKS_PER_MM);
+      gCfbTicks  = (long)(newC * C_FB_TICKS_PER_DEG);
+      gBendTicks = (long)(((long)newB * 360L) / 360L);  // Direct: 1 degree = 1 tick
+        gBendTicksLast = gBendTicks;
+        interrupts();
+      saveCalibration();
+      Serial.println("OK CAL");
+    } else {
+      Serial.println("ERR CAL format: CAL z,c,bend");
+    }
     return;
   }
-
-  /* Команда ПЛК */
-  if (strncmp(cmd,"CMD",3)==0) {
-    queueExtCmdPulse((uint16_t)atoi(cmd+3));
-    Serial.println("OK CMD");
+  if (line.startsWith("SON ")) {
+    int on = line.substring(4).toInt();
+    cmdSon(on ? 1 : 0);
     return;
   }
-
-  /* Целевой угол для ПЛК */
-  if (strncmp(cmd,"TGT",3)==0) {
-    regs[R_EXT_TGT] = atoi(cmd+3);
-    extTgtT = millis();
+  if (line.startsWith("TGT ")) {
+    gBendTargetDeg = line.substring(4).toInt();
+    gBendDone = false;
     Serial.println("OK TGT");
     return;
   }
+  if (line == "CMD 4") {
+    if (gBendCycle == 1) {
+      gBendingState = 1;
+    } else {
+      gBendingState = 2;
+    }
+    gBendDone = false;
+    Serial.println("OK BEND START");
+    return;
+  }
+  if (line.startsWith("ARCFEED ")) {
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      gArcRadius = line.substring(8, comma).toFloat();
+      gArcTargetAngle = line.substring(comma+1).toFloat();
+      gArcStartBendTicks = gBendTicks;
+        gArcStartZPulse = gZCurrentPulse;
+        gArcActive = true;
+      gZst = 2; // Use step generator
+      Serial.println("OK ARCFEED");
+    }
+    return;
+  }
+  if (line.startsWith("ARCSTOP")) {
+    noInterrupts();
+    gArcActive = false;
+    // Freeze the arc target where it ended so the rate limiter doesn't
+    // try to chase a stale reference until the next MZ arrives.
+    gZTargetPulse = (long)gZVirtualPulse;
+    interrupts();
+    Serial.println("OK ARCSTOP");
+    return;
+  }
+  if (line.startsWith("MZ ")) {
+    int comma = line.indexOf(',');
+    String sz = (comma > 0) ? line.substring(3, comma) : line.substring(3);
+    double targetZ = sz.toFloat();
+    double speedZ = 20.0;
+    if (comma > 0) speedZ = line.substring(comma+1).toFloat();
+    if (speedZ <= 0.0) speedZ = 20.0;
 
-  /* Запись в регистр */
-  if (cmd[0]=='W' && cmd[1]=='R') {
-    int r = 0, v = 0;
-    if (sscanf(cmd+2, "%d %d", &r, &v)==2 && r>=0 && r<NUM_REGS) {
-      regs[r] = (uint16_t)v;
-      Serial.print("OK WR R"); Serial.print(r); Serial.print("="); Serial.println(v);
-    } else Serial.println("ERR WR");
+    noInterrupts();
+    // Always disarm any leftover arc-sync before starting a linear move
+    gArcActive = false;
+    gZTargetPulse = (long)(targetZ * Z_CMD_TICKS_PER_MM);
+    // Sync step generator state from the encoder so we move from the
+    // physical position, not from a stale virtual one.
+    // Convert FB-scale encoder ticks to CMD-scale for step generator.
+    gZCurrentPulse = (long)(gZfbTicks * CMD_PER_FB);
+    gZVirtualPulse = gZCurrentPulse;
+    gZSpeedStep = (speedZ * Z_CMD_TICKS_PER_MM) / STEP_ISR_HZ;
+    // Trapezoidal acceleration profile
+    gZMaxSpeed = gZSpeedStep;
+    gZMinSpeed = MIN_Z_SPEED * Z_CMD_TICKS_PER_MM / STEP_ISR_HZ;
+    gZCurSpeed = gZMinSpeed;  // start from minimum speed
+    gZAccelRate = DEFAULT_Z_ACCEL * Z_CMD_TICKS_PER_MM / (STEP_ISR_HZ * STEP_ISR_HZ);
+    gZst = 2;
+    interrupts();
+    gZmm = targetZ;  // update display target
+    Serial.println("OK MZ");
+    return;
+  }
+  if (line.startsWith("MC ")) {
+    int comma = line.indexOf(',');
+    String sc = (comma > 0) ? line.substring(3, comma) : line.substring(3);
+    double targetC = sc.toFloat();
+    double speedC = 20.0;
+    if (comma > 0) speedC = line.substring(comma+1).toFloat();
+    if (speedC <= 0.0) speedC = 20.0;
+
+    noInterrupts();
+    gCTargetPulse = (long)(targetC * C_CMD_TICKS_PER_DEG);
+    // Convert FB-scale encoder ticks to CMD-scale for step generator.
+    gCCurrentPulse = (long)(gCfbTicks * CMD_PER_FB);
+    gCVirtualPulse = gCCurrentPulse;
+    gCSpeedStep = (speedC * C_CMD_TICKS_PER_DEG) / STEP_ISR_HZ;
+    // Trapezoidal acceleration profile
+    gCMaxSpeed = gCSpeedStep;
+    gCMinSpeed = MIN_C_SPEED * C_CMD_TICKS_PER_DEG / STEP_ISR_HZ;
+    gCCurSpeed = gCMinSpeed;  // start from minimum speed
+    gCAccelRate = DEFAULT_C_ACCEL * C_CMD_TICKS_PER_DEG / (STEP_ISR_HZ * STEP_ISR_HZ);
+    gCst = 2;
+    interrupts();
+    gCdeg = targetC;  // update display target
+    Serial.println("OK MC");
     return;
   }
 
-  Serial.println("ERR ?");
-}
-
-void pollUsb() {
-  while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (usbN > 0) { usbBuf[usbN] = 0; processUsb(usbBuf); usbN = 0; }
-    } else if (usbN < 126) {
-      usbBuf[usbN++] = c;
+  if (line.startsWith("STEP ")) {
+    int comma = line.indexOf(',');
+    if (comma > 0) {
+      gStepCurrent = line.substring(5, comma).toInt();
+      gStepTotal = line.substring(comma + 1).toInt();
     }
+    Serial.println("OK STEP");
+    return;
   }
-}
 
-/* ======================== SETUP ======================== */
+  // ──── VFD Commands ────
+  if (line.startsWith("VFDFREQ ")) {
+    int spaceIdx = line.indexOf(' ', 8);
+    if (spaceIdx > 0) {
+      float freq = line.substring(8, spaceIdx).toFloat();
+      int dir = line.substring(spaceIdx + 1).toInt();
+      cmdVfdFrequency(freq, dir);
+    }
+    return;
+  }
+
+  if (line.startsWith("VFDSIM ")) {
+    int sim = line.substring(7).toInt();
+    gVfdSimulationMode = (sim ? true : false);
+    Serial.println(gVfdSimulationMode ? "OK VFDSIM ON" : "OK VFDSIM OFF");
+    return;
+  }
+
+  if (line == "VFDSTOP") {
+    cmdVfdStop();
+    return;
+  }
+
+  if (line == "VFDSTATUS") {
+    Serial.print("VFD Status: freq=");
+    Serial.print(gVfdCurrentFreqCode / 100.0);
+    Serial.print("Hz, tgt=");
+    Serial.print(gVfdTargetFreqCode / 100.0);
+    Serial.print("Hz, cur=");
+    Serial.print(gVfdCurrentCurrent / 10.0);
+    Serial.print("A, ctrl=0x");
+    Serial.print(gVfdControlWord, HEX);
+    Serial.print(", sim=");
+    Serial.println(gVfdSimulationMode ? "ON" : "OFF");
+    return;
+  }
+
+  // ──── End VFD Commands ────
+
+}
 
 void setup() {
-  /* RS-485 */
-  pinMode(RS485_DE, OUTPUT);
-  txEn(false);
-  Serial1.begin(MODBUS_BAUD, SERIAL_8N1);
+  Wire.begin(); // Join I2C bus (SDA=18, SCL=19)
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Trubogib ready");
 
-  /* USB-Serial (EXE + debug) */
   Serial.begin(115200);
-  delay(100);
-  Serial.println("=== Teensy 4.1 Trubogib v" FW_VERSION " ===");
-  Serial.print("CPU: "); Serial.print(F_CPU / 1000000); Serial.println(" MHz");
-  Serial.println("Modbus Slave ID=1, 115200 8N1");
-  Serial.println("Type ? for status, HELP for commands");
+  gResetCause = SRC_SRSR;
+  Serial1.begin(VFD_BAUD, SERIAL_8N2);
 
-  /* Step/Dir */
-  pinMode(PIN_STEP_Z, OUTPUT); digitalWriteFast(PIN_STEP_Z, LOW);
-  pinMode(PIN_DIR_Z,  OUTPUT); digitalWriteFast(PIN_DIR_Z,  LOW);
-  pinMode(PIN_STEP_C, OUTPUT); digitalWriteFast(PIN_STEP_C, LOW);
-  pinMode(PIN_DIR_C,  OUTPUT); digitalWriteFast(PIN_DIR_C,  LOW);
+  // ──── VFD Modbus Initialization ────
+  gVfdModbus = new ModbusRTU(Serial1, RS485_DE);
+  Serial.println("[VFD] Modbus RTU initialized on Serial1");
+  gVfdSimulationMode = false;  // Set to true for testing without hardware
 
-  /* Пины 6-9: ЗАПАС (SON через ПЛК DO7/DO8, Home — при необходимости) */
-  /* pinMode(6, OUTPUT); — не используется */
-  /* pinMode(7, OUTPUT); — не используется */
-  /* pinMode(8, INPUT_PULLUP); — не используется */
-  /* pinMode(9, INPUT_PULLUP); — не используется */
+  if (CrashReport) {
+    Serial.println("[CRASH] Previous crash report:");
+    Serial.print(CrashReport);
+    Serial.println();
+  }
 
-  /* Инициализация осей */
-  memset(&az, 0, sizeof(az));
-  az.pStep = PIN_STEP_Z; az.pDir = PIN_DIR_Z;
-  az.pSon  = 0;  az.pHome = 0;   /* пины 6-9 запас, SON через ПЛК */
-  az.spu   = STEPS_MM_Z; az.fMax  = FREQ_MAX_Z; az.acc = ACCEL_HZ_S_Z;
+  pinMode(RS485_DE, OUTPUT);
+  digitalWrite(RS485_DE, LOW);
 
-  memset(&ac, 0, sizeof(ac));
-  ac.pStep = PIN_STEP_C; ac.pDir = PIN_DIR_C;
-  ac.pSon  = 0;  ac.pHome = 0;
-  ac.spu   = STEPS_DEG_C; ac.fMax = FREQ_MAX_C; ac.acc = ACCEL_HZ_S_C;
+  pinMode(PIN_STEP_Z, OUTPUT);
+  pinMode(PIN_DIR_Z, OUTPUT);
+  pinMode(PIN_STEP_C, OUTPUT);
+  pinMode(PIN_DIR_C, OUTPUT);
 
-  /* Регистры */
-  memset(regs, 0, sizeof(regs));
+  pinMode(PIN_SON_Z, OUTPUT);
+  pinMode(PIN_SON_C, OUTPUT);
+  pinMode(PIN_CLAMP, OUTPUT);
+  pinMode(PIN_UNCLAMP, OUTPUT);
+  
+  gServoOn = false;
+  digitalWrite(PIN_SON_Z, LOW);
+  digitalWrite(PIN_SON_C, LOW);
+  digitalWrite(PIN_CLAMP, HIGH);     // Initial state: both HIGH = disabled (ACTIVE LOW!)
+  digitalWrite(PIN_UNCLAMP, HIGH);   // Initial state: both HIGH = disabled (ACTIVE LOW!)
+
+  // IMPORTANT: open-collector outputs from PC817 require pull-up
+  pinMode(PIN_ENC_BEND_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_BEND_B, INPUT_PULLUP);
+  // A and B channel interrupts for proper quadrature decode (both transitions needed)
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_BEND_A), isrBendEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_BEND_B), isrBendEncoder, CHANGE);
+
+  // Servo feedback encoders via MAX490 (differential → single-ended, 5 V TTL)
+  // Polled from main loop — ISR-based decoding caused USB instability previously.
+  pinMode(PIN_ENC_Z_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_Z_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_C_A, INPUT_PULLUP);
+  pinMode(PIN_ENC_C_B, INPUT_PULLUP);
+
+  pinMode(PIN_PEDAL_FWD, INPUT_PULLUP);
+  pinMode(PIN_PEDAL_REV, INPUT_PULLUP);
+  pinMode(PIN_MODE_SW, INPUT_PULLUP);
+  pinMode(PIN_LIM_Z_MIN, INPUT_PULLUP);
+  pinMode(PIN_LIM_Z_MAX, INPUT_PULLUP);
+
+  // Restore last calibration from EEPROM (survives reboot)
+  if (loadCalibration()) {
+    Serial.println("=== Calibration restored from EEPROM ===");
+  } else {
+    Serial.println("=== No calibration in EEPROM, starting from 0 ===");
+  }
+
+  // Step ISR period = 1e6 / STEP_ISR_HZ microseconds.
+  // 5.0 μs → 200 kHz ISR → 100 kHz max STEP pulse rate → ~275 mm/s max feed.
+  stepTimer.begin(stepIsr, 1e6 / STEP_ISR_HZ);
+  gStepTimerRunning = true;
+
+
+  Serial.println("=== Teensy TubeBender v4.21 ===");
 }
 
-/* ======================== MAIN LOOP ======================== */
+// ═════════════════════════════════════════════════════════════════════
+// LCD Display Update Function
+// ═════════════════════════════════════════════════════════════════════
+void updateLCDDisplay() {
+    // ─────────────────────────────────────────────────────────────
+    // Заполнить структуру DisplayData из глобальных переменных
+    // ─────────────────────────────────────────────────────────────
+    
+    // Позиции осей
+    lcdData.currentZ_mm = gZmm;
+    lcdData.targetZ_mm = (double)gZTargetPulse / Z_CMD_TICKS_PER_MM;
+    
+    lcdData.currentC_deg = gCdeg;
+    lcdData.targetC_deg = (double)gCTargetPulse / C_CMD_TICKS_PER_DEG;
+    
+    // Гибка
+    lcdData.currentBend_deg = bendDegFromTicks(gBendTicks);
+    lcdData.targetBend_deg = gBendTargetDeg;
+    
+    // Программа
+    lcdData.currentStep = gStepCurrent;
+    lcdData.totalSteps = gStepTotal;
+    
+    // Диагностика
+    lcdData.loopHz = gDiagLoopHz;
+    lcdData.stepHz = gDiagStepHz;
+    
+    // Статус подключения и оборудования
+    lcdData.isConnected = (millis() - gLastExePing < 5000);
+    lcdData.servoOn = gServoOn;
+    
+    // Ограничители
+    lcdData.limitZMinActive = limZMin();
+    lcdData.limitZMaxActive = limZMax();
+    
+    // ─────────────────────────────────────────────────────────────
+    // LOGIC: Определить текущее состояние машины
+    // ─────────────────────────────────────────────────────────────
+    
+    // 1. ПЕРВЫЙ ПРИОРИТЕТ: Ошибки (limit switches)
+    if (lcdData.limitZMinActive) {
+        currentLCDState = LCDScenarios::STATE_ERROR;
+        lcdData.errorCode = 0x0001;  // Limit Z Min
+    }
+    else if (lcdData.limitZMaxActive) {
+        currentLCDState = LCDScenarios::STATE_ERROR;
+        lcdData.errorCode = 0x0002;  // Limit Z Max
+    }
+    
+    // 2. ВТОРОЙ ПРИОРИТЕТ: Подключение
+    else if (!lcdData.isConnected) {
+        currentLCDState = LCDScenarios::STATE_CONNECTION;
+    }
+    
+    // 3. ТРЕТИЙ ПРИОРИТЕТ: Текущая фаза движения
+    else if (!gBendDone && gBendTargetDeg > 0) {
+        // ГИБКА
+        currentLCDState = LCDScenarios::STATE_BENDING;
+    }
+    
+    else if (gZst == 2 || (gZCurrentPulse != (long)gZTargetPulse)) {
+        // ПОДАЧА Z
+        currentLCDState = LCDScenarios::STATE_FEED;
+    }
+    
+    else if (gCst == 2 || (gCCurrentPulse != (long)gCTargetPulse)) {
+        // РОТАЦИЯ C
+        currentLCDState = LCDScenarios::STATE_ROTATION;
+    }
+    
+    else if (gArcActive) {
+        // ARC FEED (синхронная подача во время гибки)
+        currentLCDState = LCDScenarios::STATE_FEED;
+    }
+    
+    // 4. ЧЕТВЁРТЫЙ ПРИОРИТЕТ: Idle
+    else {
+        currentLCDState = LCDScenarios::STATE_IDLE;
+    }
+    
+    // ─────────────────────────────────────────────────────────────
+    // Обновить дисплей
+    // ─────────────────────────────────────────────────────────────
+    LCDScenarios::update(lcd, lcdData, currentLCDState);
+}
 
+// ═════════════════════════════════════════════════════════════════════
+// Main Loop
+// ═════════════════════════════════════════════════════════════════════
 void loop() {
-  pollMb();                         /* 1. Modbus RS-485 (приоритет) */
-  pollUsb();                        /* 2. USB-Serial (EXE + отладка) */
-  procAxisCmd();                    /* 3. Команды осей из регистра */
-  serviceExtCmdPulse();             /* 3.1 Надежная доставка CMD в ПЛК (8/9) */
-  homeUpdate(az, tmZ, isrZ);       /* 4. FSM Home Z (debounce) */
-  homeUpdate(ac, tmC, isrC);       /* 5. FSM Home C (debounce) */
-  updateRegs();                     /* 6. Обновление read-only регистров */
-  checkAlarms();                    /* 7. Проверка аларм серво (от ПЛК D17/D18) */
-  checkWD();                        /* 8. Watchdog (>2с → E-Stop) */
-  clearPlcRegs();                   /* 9. Авто-сброс команд ПЛК */
+  pollFeedbackEncoders();
+
+  // Keep runtime position fields synchronized to encoder feedback.
+  // This avoids reporting stale command targets in status JSON.
+  {
+    long zFb, cFb;
+    noInterrupts();
+    zFb = gZfbTicks;
+    cFb = gCfbTicks;
+    interrupts();
+    gZmm  = (double)zFb / Z_FB_TICKS_PER_MM;
+    gCdeg = (double)cFb / C_FB_TICKS_PER_DEG;
+  }
+
+  // --- Mock PLC Bending Logic ---
+  noInterrupts();
+  long tempTicks = gBendTicks;
+  interrupts();
+  int currentBend = (int)round(tempTicks / 4.0);  // Quadrature X4: 4 ticks = 1 degree
+  
+  if (gBendingState == 1) {
+    if (abs(currentBend) >= gBendTargetDeg) {
+      gBendCycle = 2;
+      gBendDone = true;
+      gBendingState = 0;
+    }
+  } else if (gBendingState == 2) {
+    if (abs(currentBend) <= 1) {
+      gBendCycle = 1;
+      gBendDone = true;
+      gBendingState = 0;
+    }
+  }
+
+  // ──── VFD Status Poll ────
+  // Back-off poll: every 100 ms while VFD talks; if it falls silent, the
+  // interval ramps to 2 s so the blocking Modbus timeout (~100 ms per failed
+  // read) stops starving pollFeedbackEncoders() every main-loop pass.
+  static uint32_t vfdPollLastMs = 0;
+  static uint32_t vfdPollIntervalMs = 100;
+  static uint32_t vfdPrevMbErr = 0;
+  static uint32_t vfdPrevMbRx  = 0;
+  if (millis() - vfdPollLastMs >= vfdPollIntervalMs) {
+    vfdPollLastMs = millis();
+    pollVfdStatus();
+    if (gMbRx != vfdPrevMbRx) {
+      vfdPollIntervalMs = 100;               // healthy link → fast poll
+    } else if (gMbErr != vfdPrevMbErr) {
+      vfdPollIntervalMs = 2000;              // timeout → back off to 2 s
+    }
+    vfdPrevMbErr = gMbErr;
+    vfdPrevMbRx  = gMbRx;
+  }
+  // ──── End VFD Poll ────
+
+  // LCD refresh throttled to 500 ms: I2C char LCD takes tens of ms per
+  // frame — any faster starves pollFeedbackEncoders() of main-loop time.
+  static unsigned long lastLcdUpdate = 0;
+  if (millis() - lastLcdUpdate > 500) {
+    lastLcdUpdate = millis();
+    updateLCDDisplay();  // ← LCD обновляется через LCD_SCENARIOS
+  }
+
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    gRxCharsAcc++;
+    if (c == '\n' || c == '\r') {
+      if (gRxLine.length() > 0) {
+        handleCommand(gRxLine);
+        gRxLine = "";
+      }
+    } else {
+      gRxLine += c;
+      if (gRxLine.length() > 120) {
+        gRxLine = "";
+        gRxOverflowAcc++;
+      }
+    }
+  }
+
+  // Update diagnostic rates once per second
+  static uint32_t diagLastMs = 0;
+  static uint32_t diagPrevStep = 0;
+  static uint32_t diagPrevBend = 0;
+  static uint32_t diagPrevZ = 0;
+  static uint32_t diagPrevC = 0;
+  static uint32_t diagPrevRx = 0;
+  static uint32_t diagPrevOv = 0;
+  static uint32_t diagLoopCount = 0;
+  static uint32_t diagLastLoopUs = 0;
+  static uint32_t diagMaxLoopUs = 0;
+
+  uint32_t nowUs = micros();
+  if (diagLastLoopUs != 0) {
+    uint32_t dtUs = nowUs - diagLastLoopUs;
+    if (dtUs > diagMaxLoopUs) diagMaxLoopUs = dtUs;
+  }
+  diagLastLoopUs = nowUs;
+  diagLoopCount++;
+
+  uint32_t nowMs = millis();
+  if (nowMs - diagLastMs >= 1000) {
+    noInterrupts();
+    uint32_t stepCnt = gStepIsrCount;
+    uint32_t bendCnt = gBendIsrCount;
+    uint32_t zCnt = gZfbIsrCount;
+    uint32_t cCnt = gCfbIsrCount;
+    interrupts();
+
+    gDiagStepHz = stepCnt - diagPrevStep;
+    gDiagBendHz = bendCnt - diagPrevBend;
+    gDiagZfbHz = zCnt - diagPrevZ;
+    gDiagCfbHz = cCnt - diagPrevC;
+    gDiagLoopHz = diagLoopCount;
+    gDiagLoopMaxUs = diagMaxLoopUs;
+    gDiagRxCharsPerSec = gRxCharsAcc - diagPrevRx;
+    gDiagRxOverflowPerSec = gRxOverflowAcc - diagPrevOv;
+
+    diagPrevStep = stepCnt;
+    diagPrevBend = bendCnt;
+    diagPrevZ = zCnt;
+    diagPrevC = cCnt;
+    diagPrevRx = gRxCharsAcc;
+    diagPrevOv = gRxOverflowAcc;
+    diagLoopCount = 0;
+    diagMaxLoopUs = 0;
+    diagLastMs = nowMs;
+  }
+
+  // Runtime local manual control fallback
+  bool fwd = pedalFwdPressed();
+  bool rev = pedalRevPressed();
+  bool autoMode = modeAuto();
+
+  if (!autoMode) {
+    if (fwd && !rev) {
+      gVfdRunning = true;
+      gVfdForward = true;
+      gVfdFreqHz100 = 3000;
+    } else if (rev && !fwd) {
+      gVfdRunning = true;
+      gVfdForward = false;
+      gVfdFreqHz100 = 3000;
+    } else {
+      gVfdRunning = false;
+      gVfdFreqHz100 = 0;
+    }
+  }
+
+  // Mark bend done transition whenever encoder changed enough
+  long nowTicks = gBendTicks;
+  if (nowTicks != gBendTicksLast) {
+    gBendDone = false;
+    gBendTicksLast = nowTicks;
+  }
+
+  // IMPORTANT: disable unsolicited status transmission.
+  // Host must be the single source of polling via '?' to keep USB traffic
+  // deterministic during SON transitions.
 }
